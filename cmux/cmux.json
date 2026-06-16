@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux.schema.json",
+  "schemaVersion": 1,
+
+  // Force dark mode so the terminal always uses the dark theme (TokyoNight Storm),
+  // regardless of the OS appearance. "system" follows the OS; "light" forces light.
+  "app": { "appearance": "dark" },
+
+  // Tint the sidebar with the terminal background (navy) instead of the default
+  // black tint, so the left bar matches the terminal.
+  "sidebarAppearance": { "matchTerminalBackground": true }
+
+  // This file is JSONC (JSON with comments). Only the keys above are file-managed;
+  // everything else falls back to whatever is saved in cmux Settings.
+  // cmux auto-generates a fully-commented template listing every available key
+  // (app/terminal/notifications/sidebar/workspaceColors/automation/browser/shortcuts)
+  // on first launch when this file is missing. To see all keys and paths:
+  //   cmux config paths        # where each config file lives
+  //   cmux config check        # validate this JSONC file
+  // Schema: the $schema URL above.
+}

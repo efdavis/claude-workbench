@@ -1,0 +1,51 @@
+/*
+ * National Park Poster palette
+ *
+ * The color scheme behind my wiki UI (the `wiki-site/` Docusaurus shell in
+ * this repo). Pulled out here so it's reusable in any project.
+ *
+ *   --np-*          Portable palette tokens. Drop these into any site.
+ *   --ifm-* /       Map the palette onto Docusaurus's theme variables.
+ *   --docusaurus-*  Keep them for a Docusaurus site; delete them otherwise.
+ *
+ * Reuse instructions: ./README.md
+ */
+:root {
+  --np-pine: #2b3a1f;
+  --np-meadow: #5a7e3b;
+  --np-sand: #d4a574;
+  --np-sunset: #c25e28;
+  --np-dusk: #1e2a3a;
+  --np-cream: #f1ebd9;
+  --np-bark: #1a1410;
+
+  --ifm-color-primary: #5a7e3b;
+  --ifm-color-primary-dark: #4f6e34;
+  --ifm-color-primary-darker: #45612e;
+  --ifm-color-primary-darkest: #364e23;
+  --ifm-color-primary-light: #6a8e48;
+  --ifm-color-primary-lighter: #7a9b58;
+  --ifm-color-primary-lightest: #94b074;
+
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #94b074;
+  --ifm-color-primary-dark: #82a360;
+  --ifm-color-primary-darker: #759954;
+  --ifm-color-primary-darkest: #608045;
+  --ifm-color-primary-light: #a6bd87;
+  --ifm-color-primary-lighter: #b3c697;
+  --ifm-color-primary-lightest: #c8d6b3;
+
+  --ifm-background-color: #0f1815;
+  --ifm-background-surface-color: #15201b;
+  --ifm-navbar-background-color: #0a110e;
+  --ifm-footer-background-color: #0a110e;
+  --ifm-color-content: #e6e3d6;
+  --ifm-color-content-secondary: #b9b7a8;
+
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}

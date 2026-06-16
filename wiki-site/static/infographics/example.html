@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Example infographic</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #1e2a3a;
+        color: #f1ebd9;
+        font-family: system-ui, sans-serif;
+        text-align: center;
+      }
+      .card { padding: 3rem; }
+      h1 { font-size: clamp(2rem, 6vw, 4rem); margin: 0 0 0.5rem; }
+      p { opacity: 0.8; max-width: 40ch; margin: 0 auto; }
+      code { background: rgba(255,255,255,0.1); padding: 0.1em 0.4em; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Example infographic</h1>
+      <p>
+        Self-contained HTML served from <code>static/infographics/</code>.
+        Replace this file with your own. Reachable at
+        <code>/infographics/example.html</code>.
+      </p>
+    </div>
+  </body>
+</html>

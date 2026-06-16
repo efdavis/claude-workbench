@@ -1,0 +1,12 @@
+# Ghostty config — read by cmux for terminal appearance.
+# Apply changes live with:  cmux reload-config   (no app restart needed)
+
+# Font: cmux's bundled default is JetBrains Mono (matches the other machine).
+# Leaving font-family unset uses that default. Nerd Font glyphs still render
+# via cmux's bundled symbol fallback.
+#   To use Maple Mono instead:  font-family = Maple Mono NF
+font-size = 17
+
+# Color theme is managed by cmux (`cmux themes set ...`) -> TokyoNight Storm.
+# Brighten the text a touch above the theme's #c0caf5 (not full white).
+foreground = #d6ddfa
