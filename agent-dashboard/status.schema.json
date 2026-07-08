@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/efdavis/claude-workbench/agent-dashboard/status.schema.json",
+  "title": "Agent run status snapshot",
+  "description": "Status drop for one agent run (one cmux/tmux session driving a command over one issue). Written atomically (mktemp + mv) by emit-status.sh at each phase boundary; read by dashboard.py. Runtime-only: these live in ${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}/, never in a repo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session", "role", "state", "iso_timestamp", "epoch"],
+  "properties": {
+    "session": {
+      "type": "string",
+      "description": "Unique id for this run (cmux pane id, tmux session, or issue+role). Also the snapshot filename stem."
+    },
+    "role": {
+      "type": "string",
+      "description": "Which command drives this run.",
+      "enum": ["planner", "worker", "reviewer", "finisher", "groomer", "other"]
+    },
+    "state": {
+      "type": "string",
+      "description": "Coarse lifecycle state. Fine-grained progress lives on the issue/PR, not here. 'waiting' = paused at a routine human gate (expected flow); 'escalated' = urgent, off-happy-path (failure, hard stop) - the one that flags 'needs you NOW'. Red is earned.",
+      "enum": ["started", "implementing", "reviewing", "waiting", "pr-open", "merged", "escalated", "done"]
+    },
+    "iso_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC timestamp of this status write."
+    },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix seconds at write time. Used for age math without re-parsing iso_timestamp."
+    },
+    "ticket": {
+      "type": "string",
+      "description": "The issue id this run owns, when issue-bound (free-form: PROJ-123, #123, a URL, etc.)."
+    },
+    "pr_number": {
+      "type": "string",
+      "description": "GitHub PR number once a PR is open (string to tolerate empty/absent)."
+    },
+    "worktree_path": {
+      "type": "string",
+      "description": "Absolute path to the run's git worktree on disk."
+    },
+    "model": {
+      "type": "string",
+      "description": "Which Claude model drives this run (e.g. opus, sonnet, haiku, or a full id). Set via --model, else auto-detected from $AGENT_DASHBOARD_MODEL or cmux's launch argv."
+    },
+    "cmux_surface": {
+      "type": "string",
+      "description": "The emitting session's cmux surface UUID ($CMUX_SURFACE_ID), captured best-effort by emit-status.sh. dashboard.py matches it against `cmux tree` for pane liveness. Absent outside cmux."
+    },
+    "note": {
+      "type": "string",
+      "description": "One-line human-readable status the operator sees in the dashboard."
+    }
+  }
+}

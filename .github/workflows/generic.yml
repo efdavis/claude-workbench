@@ -1,0 +1,21 @@
+name: generic
+
+# Keep the toolkit vendor-neutral + GitHub-native, and keep the dashboard emitter's
+# contract green. Both gates are pure shell/stdlib — no install step needed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Genericness gate (vendor-neutral, GitHub-native)
+        run: ./agent-dashboard/check-generic.sh
+      - name: emit-status contract test
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          ./agent-dashboard/emit-status.test.sh

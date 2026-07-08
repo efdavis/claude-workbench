@@ -9,7 +9,6 @@ Slack uses mrkdwn, not standard Markdown.
 - Generic link: `<https://example.com|display text>`
 - Jira: `<https://<your-company>.atlassian.net/browse/<KEY>|<KEY>>`
 - GitHub PR: `<https://github.com/<owner>/<repo>/pull/<n>|PR #<n>>`
-- GitLab MR: `<https://gitlab.com/<ns>/-/merge_requests/<n>|MR !<n>>`
 
 ## Bold & Text
 

@@ -8,7 +8,7 @@ argument-hint: "<issue-id | URL | free-form description>"
 Investigate an issue thoroughly, gather all relevant context, then produce an implementation plan.
 
 **Input**: `$ARGUMENTS` — one of:
-- A provider URL (`https://github.com/org/repo/issues/123`, `https://gitlab.com/.../issues/45`, `https://company.atlassian.net/browse/PROJ-123`)
+- A provider URL (`https://github.com/org/repo/issues/123`, `https://company.atlassian.net/browse/PROJ-123`)
 - An issue ID (`PROJ-123`, `#123`, `gh:123`)
 - A free-form description (`"fix the flaky login test"`)
 
@@ -22,7 +22,6 @@ Detect the shape of `$ARGUMENTS`:
 |---------|----------|
 | `atlassian.net/browse/` in URL | Jira |
 | `github.com/.../issues/` in URL | GitHub |
-| `gitlab.com/.../issues/` in URL | GitLab |
 | `PROJ-123` pattern (project-number) | Jira (requires `cloudId` — ask user if unknown) |
 | `#123` or `gh:123` | GitHub (use `gh` CLI against current repo) |
 | Free-form text | No fetch; treat as the description directly |
@@ -30,8 +29,6 @@ Detect the shape of `$ARGUMENTS`:
 **If Jira**: launch the `issue-lookup` agent (or call the Atlassian MCP if available). Fetch fields `summary,description,status,priority,issuetype,parent,issuelinks,labels`.
 
 **If GitHub**: `gh issue view <number> --json title,body,state,labels,assignees,milestone,comments`
-
-**If GitLab**: `glab issue view <id> --output json` (or `glab api`)
 
 **If free-form**: skip Phase 1, use the text as the scope.
 
@@ -154,6 +151,19 @@ Write the plan to `~/.claude/plans/<slug>.md` AND output a summary in chat:
 - [ ] No step is vague
 - [ ] Testing section is actionable
 - [ ] Confidence accounts for unknowns found in Phase 3
+
+## Dashboard status (best-effort)
+
+If the agent dashboard is installed, emit run status so it shows live. Resolve the emitter once; if absent, skip silently — an emit must never block or fail planning. Never hand-write JSON into the state dir; only the emitter writes snapshots.
+
+```bash
+EMIT="${AGENT_DASHBOARD_HOME:+$AGENT_DASHBOARD_HOME/emit-status.sh}"
+[ -x "$EMIT" ] || EMIT="$(command -v emit-status.sh 2>/dev/null || true)"
+```
+
+With `TICKET` = the issue id/slug and `SESSION="$TICKET-planner"`, emit (skip all if `$EMIT` is empty):
+
+- At Phase 1 (start): `"$EMIT" --session "$SESSION" --role planner --state started --ticket "$TICKET" --note "planning"`
 
 ## Gotchas
 

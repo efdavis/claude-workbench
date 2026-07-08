@@ -88,6 +88,23 @@ Work through the plan step by step. For each step:
 
 If a step's assumptions are wrong (file moved, pattern changed, API different), stop and tell the user. Propose an adjustment. **Wait for confirmation** before continuing.
 
+### 2c. Diff self-audit (before pre-commit)
+
+Audit the diff against the mechanism the plan committed to — a cheap safety net before the checks run:
+
+```bash
+git diff --stat
+git diff
+```
+
+Check:
+1. **Mechanism alignment** — compare the diff's shape to the plan's approach. If the delivered change is **broader** than planned (more files, more coupling, more surface than the plan described), stop and tell the user. Scope creep caught here is cheap; caught in review it isn't.
+2. **Loose-type / unchecked-cast sweep** — grep changed files for the language's escape hatches (`: any` / `as any` / `as unknown as` in TS, `interface{}` in Go, `# type: ignore`, etc.). Replace with concrete types, or note why it's unavoidable.
+3. **Dead-branch scan** — for each new conditional or fallback, is a branch unreachable given an earlier guard? (e.g. `if (x != null) { use(x ?? default) }` — the `?? default` is dead.)
+4. **No hardcoded user-facing strings** where the repo uses i18n — use the existing translation mechanism.
+
+Fix anything surfaced before Step 3.
+
 ---
 
 ## Step 3: Pre-commit Checks
@@ -106,10 +123,27 @@ If the repo has a `package.json`, detect the package manager from the lockfile (
 
 ## User Checkpoints
 
-Only 2 explicit checkpoints where you MUST stop and wait:
+Explicit checkpoints where you MUST stop and wait:
 
 1. **Step 1c** — If existing branches found, ask what to do
 2. **Step 2b** — If plan assumptions are wrong, propose adjustment and wait
+3. **Step 2c** — If the diff is broader than the plan's mechanism, stop and surface it
+
+## Dashboard status (best-effort)
+
+If the agent dashboard is installed, emit run status at each phase so it shows live. Resolve the emitter once; if absent, skip silently — an emit must never block or fail the run. Never hand-write JSON into the state dir; only the emitter writes snapshots.
+
+```bash
+EMIT="${AGENT_DASHBOARD_HOME:+$AGENT_DASHBOARD_HOME/emit-status.sh}"
+[ -x "$EMIT" ] || EMIT="$(command -v emit-status.sh 2>/dev/null || true)"
+```
+
+With `TICKET` = the issue id/slug (from `$ARGUMENTS` or the branch) and `SESSION="$TICKET-worker"`, emit (skip all if `$EMIT` is empty):
+
+- Step 1 (branch created): `"$EMIT" --session "$SESSION" --role worker --state started --ticket "$TICKET" --worktree "$(git rev-parse --show-toplevel)" --note "branch <name>"`
+- Step 2 (executing the plan): `"$EMIT" --session "$SESSION" --role worker --state implementing --ticket "$TICKET" --note "implementing"`
+- Step 3 (all checks pass): `"$EMIT" --session "$SESSION" --role worker --state implementing --ticket "$TICKET" --note "checks green — ready for pr-prep"`
+- On an unrecoverable stop: `"$EMIT" --session "$SESSION" --role worker --state escalated --ticket "$TICKET" --note "<reason>"`
 
 ## Gotchas
 
