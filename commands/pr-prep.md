@@ -1,10 +1,10 @@
 ---
-description: Run checks and generate PR/MR description
+description: Run checks and generate a PR description, then commit + push + open the PR (GitHub)
 ---
 
 # PR Prep
 
-Run pre-PR checks and generate a terse PR/MR description. Works with GitHub (`gh`) or GitLab (`glab`).
+Run pre-PR checks and generate a terse PR description, then commit, push, and open the PR on GitHub (`gh`).
 
 ## Arguments
 
@@ -14,19 +14,19 @@ Parse `$ARGUMENTS` for flags:
 |------|--------|
 | `skip` | Skip all checks, jump straight to diff analysis + description |
 | `submit` | Skip Steps 1-4, go straight to commit+push+PR |
+| `draft` | Create the PR as a **draft** (`gh pr create --draft`) |
 
 No flag = run all checks in parallel (default).
 
 **Session awareness:** If checks were already run in this session, passed, and no code has changed since, skip Step 2 and go to Step 3. If any files were modified after the checks ran, re-run the affected checks.
 
-## Step 1: Detect Provider
+## Step 1: Confirm Host
 
 ```bash
 git remote get-url origin
 ```
 
-- Contains `github.com` → **GitHub** (`gh pr create`)
-- Contains `gitlab.com` or GitLab-like host → **GitLab** (`glab mr create`)
+Expect `github.com` (this command uses `gh`). If `gh` is not installed or the origin is not GitHub, stop after Step 4 (description only) and tell the user to open the PR manually.
 
 ## Step 2: Run Checks
 
@@ -44,7 +44,7 @@ Default sequence (detect package manager + language):
 
 ## Step 3: Analyze Changes
 
-After checks pass (or if `skip`), analyze the branch diff:
+After checks pass (or if `skip`), analyze the diff:
 
 ```bash
 # Detect base
@@ -61,9 +61,19 @@ git diff origin/$BASE...HEAD
 git log origin/$BASE..HEAD --oneline
 ```
 
+**If there are no commits ahead of base yet** (the work is still uncommitted — e.g. `pr-prep` was invoked right after `implement`/`code-review`, before any commit), analyze the working tree instead so the description reflects the real change:
+
+```bash
+git diff --stat HEAD
+git diff HEAD
+git ls-files --others --exclude-standard
+```
+
+The commit lands in Step 5; describe from whichever diff is non-empty.
+
 ## Step 4: Generate Description
 
-Output a terse PR/MR description in the chat window. **Do NOT commit or push anything.**
+Output a terse PR description in the chat window. **Do NOT commit or push anything.**
 
 ### Format
 
@@ -126,13 +136,12 @@ After the user reviews the description and says to proceed:
 4. Stage: `git add <files>`
 5. Commit using the **Title** from Step 4 as the commit message
 
-## Step 6: Push and Create PR/MR
+## Step 6: Push and Create PR
 
 ```bash
 git push -u origin <branch>
 ```
 
-### GitHub
 ```bash
 gh pr create --title "<title>" --body "$(cat <<'EOF'
 ## Summary
@@ -148,23 +157,7 @@ EOF
 )" --base <base-branch>
 ```
 
-### GitLab
-```bash
-glab mr create --title "<title>" --description "$(cat <<'EOF'
-## Summary
-
-<summary>
-
-## Key Changes
-
-<key-changes>
-
-<optional sections>
-EOF
-)" --target-branch <base-branch>
-```
-
-Output the PR/MR URL.
+Add `--draft` when the `draft` flag was passed. Output the PR URL.
 
 ## Step 6.5: Embed Screenshots
 
@@ -176,22 +169,21 @@ ls "${SCREENSHOT_DIR:-$HOME/Projects/screenshots}/$(git branch --show-current)/"
 
 **If screenshots exist:**
 
-1. Tell the user: "Found N screenshot(s). Include in PR/MR description?"
+1. Tell the user: "Found N screenshot(s). Include in PR description?"
 2. **Wait for confirmation.**
 3. Upload:
-   - GitHub: drag-and-drop not available via CLI; use `gh api` to upload as attachments, or tell the user to drop them in the PR UI
-   - GitLab: `curl` upload via Uploads API, then reference the returned markdown in the description
+   - Drag-and-drop is not available via CLI; use `gh api` to upload as attachments, or tell the user to drop them in the PR UI
 4. Append a `<details><summary>Screenshots</summary>...</details>` section to the description and update.
 
 **If no screenshots exist:** skip this step silently.
 
-## Step 7: Review PR/MR
+## Step 7: Review PR
 
 Show the user the URL and confirm the description looks correct. **Wait for user confirmation.** The user may want to edit directly in the UI first.
 
 ## Step 8: Triage Bot Comments
 
-After the PR/MR is created (or after force push), check for automated bot comments and resolve ones that aren't real issues. See `/babysit-pr` for the full loop.
+After the PR is created (or after force push), check for automated bot comments and resolve ones that aren't real issues. See `/babysit-pr` for the full loop.
 
 ## User Checkpoints
 
@@ -199,9 +191,25 @@ There are 3 explicit checkpoints where you MUST stop and wait:
 
 1. **After Step 4** — User reviews description, says "proceed" or requests edits
 2. **After Step 5 file list** — User confirms which files to stage
-3. **After Step 7** — User reviews the created PR/MR
+3. **After Step 7** — User reviews the created PR
 
 **Never skip a checkpoint.** Each one exists because the action that follows is visible to others or hard to reverse.
+
+## Dashboard status (best-effort)
+
+If the agent dashboard is installed, emit run status so it shows live. Resolve the emitter once; if absent, skip silently — an emit must never block or fail the run. Never hand-write JSON into the state dir; only the emitter writes snapshots.
+
+```bash
+EMIT="${AGENT_DASHBOARD_HOME:+$AGENT_DASHBOARD_HOME/emit-status.sh}"
+[ -x "$EMIT" ] || EMIT="$(command -v emit-status.sh 2>/dev/null || true)"
+```
+
+With `TICKET` = the issue id/slug (from the branch, or the argument) and `SESSION="$TICKET-finisher"`, emit (skip all if `$EMIT` is empty):
+
+- At Step 2 (checks running): `"$EMIT" --session "$SESSION" --role finisher --state reviewing --ticket "$TICKET" --note "pr-prep checks"`
+- After Step 6 (PR created): `"$EMIT" --session "$SESSION" --role finisher --state pr-open --ticket "$TICKET" --pr "<N>" --note "PR #<N> open"`
+
+The `finisher` row is continued by `/babysit-pr` (same `$TICKET-finisher` session) as it watches CI and flips to `merged`.
 
 ## Gotchas
 

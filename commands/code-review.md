@@ -15,7 +15,6 @@ git remote get-url origin
 
 Detect provider from remote URL:
 - Contains `github.com` → **GitHub** (use `gh`)
-- Contains `gitlab.com` or self-hosted GitLab → **GitLab** (use `glab`)
 - Other → local-only; skip remote PR lookups
 
 Gather the diff based on the argument:
@@ -50,15 +49,6 @@ Extract the PR number and `owner/repo` from the URL, then:
 ```bash
 gh pr diff <PR>   --repo <owner/repo>
 gh pr view <PR>   --repo <owner/repo>
-```
-
-**`<GitLab MR URL>` — remote MR:**
-
-Extract the MR IID and namespace from the URL, then:
-
-```bash
-glab mr diff <IID> --repo <namespace/project>
-glab mr view <IID> --repo <namespace/project>
 ```
 
 Use the remote `diff` command as the **sole source of truth** for what changed — the local branch may not match the remote branch. Only read local files for surrounding context that isn't in the diff.
@@ -154,6 +144,20 @@ Combine both agents' findings. Deduplicate overlapping issues. Output:
 - **GOOD** — LOW findings only
 - **NEEDS_IMPROVEMENT** — has MED findings
 - **CONCERNING** — has HIGH findings
+
+## Dashboard status (best-effort)
+
+If the agent dashboard is installed, emit run status so it shows live. Resolve the emitter once; if absent, skip silently — an emit must never block or fail the review. Never hand-write JSON into the state dir; only the emitter writes snapshots.
+
+```bash
+EMIT="${AGENT_DASHBOARD_HOME:+$AGENT_DASHBOARD_HOME/emit-status.sh}"
+[ -x "$EMIT" ] || EMIT="$(command -v emit-status.sh 2>/dev/null || true)"
+```
+
+With `TICKET` = the issue id/slug (from the argument, or derived from the current branch) and `SESSION="$TICKET-reviewer"`, emit (skip all if `$EMIT` is empty):
+
+- At Step 2 (agents launched): `"$EMIT" --session "$SESSION" --role reviewer --state reviewing --ticket "$TICKET" --note "code review"`
+- At Step 3 (synthesis done): `"$EMIT" --session "$SESSION" --role reviewer --state done --ticket "$TICKET" --note "<H> HIGH / <M> MED / <L> LOW"`
 
 ## Gotchas
 
