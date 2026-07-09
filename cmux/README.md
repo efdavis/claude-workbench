@@ -13,6 +13,7 @@ command (documented below), not by a tracked file.
 | `ghostty-config` | `~/.config/ghostty/config` | Font size, foreground brightening. cmux reads this for terminal appearance. |
 | `cmux.json` | `~/.config/cmux/cmux.json` | Dark chrome (force dark mode), navy sidebar tint. |
 | `statusline.sh` | `~/.claude/statusline.sh` | Claude Code statusline: ticket/task · model·effort · context % · cost. Also needs a one-line `statusLine` entry in `~/.claude/settings.json` (see [Statusline](#statusline)). |
+| `cost.py` | none (run in place) | Token-dollar accounting for a Claude Code session or project, read from local transcripts. Breaks out subagent / Workflow-agent spend (see [Cost accounting](#cost-accounting)). |
 
 The theme (`TokyoNight Storm`) is stored separately in
 `~/Library/Application Support/com.cmuxterm.app/config.ghostty`, written by the
@@ -87,6 +88,28 @@ TICKET description  |  model·effort  |  context %  |  cost
 * **Model chip** is colored per family (opus/sonnet/fable/haiku); anything else
   falls back to the lowercased display name. **Context %** goes green → yellow →
   orange → red as it fills. **Cost** is hidden while it's `$0.00`.
+
+## Cost accounting
+
+`cost.py` sums the token usage Claude Code records in your local session
+transcripts and prices it at Anthropic list rates. No network, no API calls; it
+only reads files. Needs Python 3, no dependencies. Run it in place:
+
+```bash
+# current project (cwd), all sessions
+python3 ~/Projects/claude-workbench/cmux/cost.py
+# one session, or bucketed by day, or as JSON
+python3 ~/Projects/claude-workbench/cmux/cost.py --session <uuid>
+python3 ~/Projects/claude-workbench/cmux/cost.py --by-day
+python3 ~/Projects/claude-workbench/cmux/cost.py --json
+```
+
+Subagents (the Task tool) and Workflow agents write their own transcripts in a
+nested directory, so a naive top-level scan under-reports fan-out-heavy
+sessions, sometimes by the majority of spend. `cost.py` walks the nested
+transcripts and prints the spawned-agent total on its own line so the fan-out
+cost is visible. Figures are list price, for relative comparison and budgeting,
+not an invoice.
 
 ## Gotchas
 
