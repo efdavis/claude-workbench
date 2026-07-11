@@ -31,6 +31,13 @@ Two moving parts, joined by a filesystem convention:
 - **`dashboard.py`** — polls that state dir (+ tmux/cmux for pane liveness: cmux rows match the
   emitter's captured `$CMUX_SURFACE_ID` against `cmux tree`, anchored, no title matching) and renders
   a live cross-section. Pure stdlib Python 3 (no `pip install`). ANSI rendering; honors `NO_COLOR`.
+- **`statusline.sh`** — a Claude Code [statusline](https://docs.claude.com/en/docs/claude-code/statusline)
+  script, and the source of the `cost` / `context` columns and the usage-limit readout. Claude Code pipes
+  a JSON blob into it on every render — a **shell hook, not a model call, so it costs zero tokens** — and
+  it mirrors three things out of that blob to `/tmp`: context % and spend (keyed by both session id and
+  `$CMUX_SURFACE_ID`, since snapshots carry the surface and not the session), and the account-wide 5-hour
+  usage limit. Copy it to `~/.claude/statusline.sh` and point `settings.json` at it. Skip it and the
+  dashboard still works — those cells just render `-`.
 
 Runtime state lives in `$HOME` (`~/.claude/agent-dashboard/state/`), **never in a repo** — the code
 is versioned, the per-run snapshots are ephemeral and machine-local.
@@ -53,7 +60,13 @@ python3 overseer.py      # optional, spare pane (run from your repo): flips rows
 
 Ctrl-C to quit (it restores your terminal on exit). The dashboard shows:
 
-- **runs** — every run (role · issue · state · model · age · pane · note): the `model` column shows which Claude model drives the run (opus/sonnet/haiku, color-coded), auto-detected per run. Escalated first, then `waiting`
+- **title** — counts, total spend, and the account's **5-hour usage limit** with its reset countdown
+  (`5h ████████░░ 81% used · resets 25m`) — the limit that actually stops work, so it reddens at 90%.
+  Needs `statusline.sh` installed; absent, the title reads as it always did.
+- **runs** — every run (role · issue · state · model · context · cost · age · pane · note): `model` shows
+  which Claude model drives the run (opus/sonnet/haiku, color-coded), `context` its context-window fill as
+  a mini bar (red near auto-compact; drops to a bare percent on a narrow pane rather than starving `note`),
+  and `cost` its spend. Escalated first, then `waiting`
   (paused at a human gate, bold yellow), active, and terminal (merged/done) dimmed then aged out after
   10m. Stale runs flagged (no update in 15m); rows capped at `AGENT_DASHBOARD_MAX_ROWS` with an overflow count.
 - **escalations** (red panel) — any run in `escalated` state. Routine gate-waits show as `waiting`, not
