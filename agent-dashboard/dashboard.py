@@ -62,6 +62,40 @@ def model_cell(model: str) -> tuple[str, tuple[str, ...]]:
     return (model or "-"), ("dim",)
 
 
+COST_GLOB = "/tmp/claude-cost-usd-surface-*.txt"
+_COST_PREFIX = "claude-cost-usd-surface-"
+# $ thresholds for the cost column; RED tracks the auto-lane's $100 handoff cap, so a
+# red cell means "this lane is about to hand off", not just "expensive".
+COST_WARN, COST_HOT = 25.0, 75.0
+
+
+def read_costs() -> dict[str, float]:
+    """Cumulative USD keyed by cmux surface id, as mirrored by the statusline on every
+    render (Claude's cost.total_cost_usd — subagent spend included). Snapshots carry the
+    same $CMUX_SURFACE_ID, so this is the join. Same best-effort contract as the
+    snapshots: an unreadable or half-written mirror is skipped, and a run with no mirror
+    (not launched under cmux, or statusline never rendered) just shows '-'."""
+    costs: dict[str, float] = {}
+    for path in glob.glob(COST_GLOB):
+        surface = os.path.basename(path)[len(_COST_PREFIX):-len(".txt")]
+        try:
+            costs[surface.upper()] = float(Path(path).read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return costs
+
+
+def cost_cell(usd: "float | None") -> tuple[str, tuple[str, ...]]:
+    """Display string + color for a run's spend. Unknown -> '-' + dim."""
+    if usd is None:
+        return "-", ("dim",)
+    if usd >= COST_HOT:
+        return f"${usd:,.2f}", ("bold", "red")
+    if usd >= COST_WARN:
+        return f"${usd:,.2f}", ("yellow",)
+    return f"${usd:,.2f}", ("green",)
+
+
 def c(text: str, *styles: str) -> str:
     if not COLOR or not styles:
         return text
@@ -171,7 +205,8 @@ def sys_line() -> str:
         return ""
 
 
-def render_frame(snaps: list[dict], live: set[str], cmux: set[str], now: int, term_width: int) -> str:
+def render_frame(snaps: list[dict], live: set[str], cmux: set[str], costs: dict[str, float],
+                 now: int, term_width: int) -> str:
     width = max(64, min(term_width, MAX_WIDTH))
     visible = [s for s in snaps
                if not (s.get("state") in TERMINAL_STATES
@@ -188,17 +223,17 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], now: int, te
 
     # column widths sized to the inner panel width
     inner = width - 4
-    W_ROLE, W_TKT, W_ST, W_MODEL, W_AGE, W_PANE = 4, 9, 12, 7, 7, 5
+    W_ROLE, W_TKT, W_ST, W_MODEL, W_COST, W_AGE, W_PANE = 4, 9, 12, 7, 9, 7, 5
     W_RUN = 16
-    seps = 7  # single spaces between 8 columns
-    W_NOTE = max(6, inner - (W_RUN + W_ROLE + W_TKT + W_ST + W_MODEL + W_AGE + W_PANE + seps))
+    seps = 8  # single spaces between 9 columns
+    W_NOTE = max(6, inner - (W_RUN + W_ROLE + W_TKT + W_ST + W_MODEL + W_COST + W_AGE + W_PANE + seps))
 
-    def rowcells(run, role, tkt, st, model, age, pane, note):
+    def rowcells(run, role, tkt, st, model, cost, age, pane, note):
         return " ".join([_cell(run, W_RUN), _cell(role, W_ROLE), _cell(tkt, W_TKT),
-                         _cell(st, W_ST), _cell(model, W_MODEL), _cell(age, W_AGE),
-                         _cell(pane, W_PANE), _cell(note, W_NOTE)])
+                         _cell(st, W_ST), _cell(model, W_MODEL), _cell(cost, W_COST),
+                         _cell(age, W_AGE), _cell(pane, W_PANE), _cell(note, W_NOTE)])
 
-    body = [c(rowcells("run", "role", "issue", "state", "model", "age", "pane", "note"), "dim")]
+    body = [c(rowcells("run", "role", "issue", "state", "model", "cost", "age", "pane", "note"), "dim")]
 
     def add(s: dict, dim: bool):
         st = s.get("state", "?")
@@ -209,12 +244,14 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], now: int, te
                 else ("stale" if stale else "-"))
         base = ("dim",) if dim else ()
         mdisp, mcolor = model_cell(s.get("model", ""))
+        cdisp, ccolor = cost_cell(costs.get(str(s.get("cmux_surface", "")).upper()))
         line = " ".join([
             c(_cell(s.get("session", "?"), W_RUN), *base),
             c(_cell(ROLE_GLYPH.get(s.get("role", "other"), "-"), W_ROLE), *base),
             c(_cell(s.get("ticket", "-"), W_TKT), *base),
             c(_cell(st, W_ST), *STATE_COLOR.get(st, ("white",))),
             c(_cell(mdisp, W_MODEL), *(("dim",) if dim else mcolor)),
+            c(_cell(cdisp, W_COST), *(("dim",) if dim else ccolor)),
             c(_cell(humanize_age(epoch, now), W_AGE), *(("red",) if stale else base)),
             c(_cell(pane, W_PANE), *(("green",) if pane == "live" else ("red",) if pane == "stale" else ("dim",))),
             c(_cell(s.get("note", ""), W_NOTE), *base),
@@ -233,11 +270,16 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], now: int, te
     if overflow:
         body.append(c(f"… +{overflow} more (raise AGENT_DASHBOARD_MAX_ROWS)", "dim"))
 
+    # Total spend across the runs on screen. Cost is per Claude session, so a lane that
+    # has handed off to a fresh tab contributes only its current session's spend.
+    spend = sum(costs.get(str(s.get("cmux_surface", "")).upper()) or 0.0 for s in visible)
+
     title = ("agent dashboard  " + datetime.now().strftime("%H:%M:%S")
              + f"   active {len(active)}"
              + (f"   waiting {len(waiting)}" if waiting else "")
              + (f"   ! escalated {len(escalated)}" if escalated else "   escalated 0")
-             + f"   done {len(terminal)}")
+             + f"   done {len(terminal)}"
+             + (f"   spend ${spend:,.2f}" if spend else ""))
 
     lines: list[str] = [c(title, "bold"), ""]
     lines += panel("runs", body, width)
@@ -261,7 +303,7 @@ def main() -> int:
     if not sys.stdout.isatty():
         now = int(time.time())
         w = shutil.get_terminal_size((120, 40)).columns
-        sys.stdout.write(render_frame(load_snapshots(), tmux_live(), cmux_live(), now, w))
+        sys.stdout.write(render_frame(load_snapshots(), tmux_live(), cmux_live(), read_costs(), now, w))
         return 0
     if not STATE_DIR.exists():
         sys.stderr.write(f"state dir {STATE_DIR} does not exist yet — waiting for the first snapshot…\n")
@@ -270,7 +312,7 @@ def main() -> int:
         while True:
             now = int(time.time())
             w = shutil.get_terminal_size((120, 40)).columns
-            sys.stdout.write(render_frame(load_snapshots(), tmux_live(), cmux_live(), now, w))
+            sys.stdout.write(render_frame(load_snapshots(), tmux_live(), cmux_live(), read_costs(), now, w))
             sys.stdout.flush()
             time.sleep(REFRESH_SECS)
     except KeyboardInterrupt:
