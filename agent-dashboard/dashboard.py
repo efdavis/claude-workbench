@@ -46,7 +46,7 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 _C = {"reset": "0", "bold": "1", "dim": "2", "red": "31", "green": "32",
       "yellow": "33", "blue": "34", "magenta": "35", "cyan": "36", "white": "37",
-      "orange": "38;5;208"}
+      "orange": "38;5;208", "teal": "38;5;37"}
 STATE_COLOR = {
     "started": ("cyan",), "implementing": ("yellow",), "reviewing": ("blue",),
     "waiting": ("bold", "yellow"), "pr-open": ("magenta",), "merged": ("green",),
@@ -55,15 +55,15 @@ STATE_COLOR = {
 ROLE_GLYPH = {"planner": "P", "worker": "W", "reviewer": "R",
               "finisher": "F", "groomer": "G", "other": "-"}
 MODEL_COLOR = {"opus": ("magenta",), "sonnet": ("cyan",), "haiku": ("green",),
-               "grok": ("orange",)}
+               "grok": ("orange",), "codex": ("teal",)}
 
 
 def model_cell(model: str) -> tuple[str, tuple[str, ...]]:
     """Short display name + color for a model string; matches on family substring
     so both 'opus' and 'claude-opus-4-8' render as 'opus'. Unknown -> raw + dim.
-    Not all runs are Claude: Eric's Grok seats emit model=grok."""
+    Not all runs are Claude: peer seats emit model=grok or model=codex."""
     m = (model or "").lower()
-    for fam in ("opus", "sonnet", "haiku", "grok"):
+    for fam in ("opus", "sonnet", "haiku", "grok", "codex"):
         if fam in m:
             return fam, MODEL_COLOR[fam]
     return (model or "-"), ("dim",)

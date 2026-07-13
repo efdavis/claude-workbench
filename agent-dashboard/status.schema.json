@@ -45,7 +45,7 @@
     },
     "model": {
       "type": "string",
-      "description": "Which model drives this run (e.g. opus, sonnet, haiku, a full id, or a non-Claude agent such as grok). Set via --model, else auto-detected from $AGENT_DASHBOARD_MODEL or cmux's launch argv — auto-detect only understands Claude/cmux launches, so non-Claude agents must pass --model explicitly."
+      "description": "Which model drives this run (e.g. opus, sonnet, haiku, a full id, or a non-Claude agent such as grok or codex). Set via --model, else auto-detected from $AGENT_DASHBOARD_MODEL or cmux's launch argv — auto-detect only understands Claude/cmux launches, so non-Claude agents must pass --model explicitly."
     },
     "cmux_surface": {
       "type": "string",
