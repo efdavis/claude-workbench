@@ -71,24 +71,35 @@ def model_cell(model: str) -> tuple[str, tuple[str, ...]]:
 
 COST_GLOB = "/tmp/claude-cost-usd-surface-*.txt"
 _COST_PREFIX = "claude-cost-usd-surface-"
+# Session-keyed mirrors (Grok seats and any non-cmux agent). Same units as surface files.
+COST_SESSION_GLOB = "/tmp/claude-cost-usd-session-*.txt"
+_COST_SESSION_PREFIX = "claude-cost-usd-session-"
 # $ thresholds for the cost column; RED tracks the auto-lane's $100 handoff cap, so a
 # red cell means "this lane is about to hand off", not just "expensive".
 COST_WARN, COST_HOT = 25.0, 75.0
 
 
-def read_costs() -> dict[str, float]:
-    """Cumulative USD keyed by cmux surface id, as mirrored by statusline.sh on every
-    render (Claude's cost.total_cost_usd — subagent spend included). Snapshots carry the
-    same $CMUX_SURFACE_ID, so this is the join. Same best-effort contract as the
-    snapshots: an unreadable or half-written mirror is skipped, and a run with no mirror
-    (not launched under cmux, or statusline never rendered) just shows '-'."""
-    costs: dict[str, float] = {}
-    for path in glob.glob(COST_GLOB):
-        surface = os.path.basename(path)[len(_COST_PREFIX):-len(".txt")]
+def _read_float_glob(pattern: str, prefix: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for path in glob.glob(pattern):
+        key = os.path.basename(path)[len(prefix):-len(".txt")]
         try:
-            costs[surface.upper()] = float(Path(path).read_text().strip())
+            out[key.upper()] = float(Path(path).read_text().strip())
         except (OSError, ValueError):
             continue
+    return out
+
+
+def read_costs() -> dict[str, float]:
+    """Cumulative USD keyed by cmux surface id *and* dashboard session id.
+
+    Surface keys: statusline.sh mirrors ($CMUX_SURFACE_ID) for Claude under cmux.
+    Session keys: `/tmp/claude-cost-usd-session-<session>.txt` for non-cmux agents
+    (Grok seats emit `session=ember-grok-N` with no surface). Same best-effort contract:
+    unreadable/absent -> skipped; render joins surface first, then session (see
+    `gauge_for`)."""
+    costs = _read_float_glob(COST_GLOB, _COST_PREFIX)
+    costs.update(_read_float_glob(COST_SESSION_GLOB, _COST_SESSION_PREFIX))
     return costs
 
 
@@ -105,26 +116,48 @@ def cost_cell(usd: "float | None") -> tuple[str, tuple[str, ...]]:
 
 CTX_GLOB = "/tmp/claude-context-pct-surface-*.txt"
 _CTX_PREFIX = "claude-context-pct-surface-"
+CTX_SESSION_GLOB = "/tmp/claude-context-pct-session-*.txt"
+_CTX_SESSION_PREFIX = "claude-context-pct-session-"
 CTX_BAR_CELLS = 8
 # Context-window fill thresholds, same ladder statusline.sh colors on. RED means the run
 # is near auto-compact, i.e. about to lose fidelity — not merely "a long session".
 CTX_WARN, CTX_HOT, CTX_CRIT = 30, 60, 80
 
 
-def read_ctx() -> dict[str, int]:
-    """Context-window % used, keyed by cmux surface id, as mirrored by statusline.sh on
-    every render (Claude's context_window.used_percentage — it hands the statusline the
-    number, so nothing here costs a token). Same best-effort contract as read_costs: an
-    unreadable or half-written mirror is skipped, and a run with no mirror (not launched
-    under cmux, or statusline never rendered) just shows '-'."""
-    pcts: dict[str, int] = {}
-    for path in glob.glob(CTX_GLOB):
-        surface = os.path.basename(path)[len(_CTX_PREFIX):-len(".txt")]
+def _read_int_glob(pattern: str, prefix: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for path in glob.glob(pattern):
+        key = os.path.basename(path)[len(prefix):-len(".txt")]
         try:
-            pcts[surface.upper()] = int(float(Path(path).read_text().strip()))
+            out[key.upper()] = int(float(Path(path).read_text().strip()))
         except (OSError, ValueError):
             continue
+    return out
+
+
+def read_ctx() -> dict[str, int]:
+    """Context-window % used, keyed by cmux surface id *and* dashboard session id.
+
+    Surface keys: statusline.sh (Claude). Session keys: Grok seat hook writes
+    `/tmp/claude-context-pct-session-ember-grok-N.txt` from signals.json
+    `contextWindowUsage`. Join prefers surface, then session (see `gauge_for`)."""
+    pcts = _read_int_glob(CTX_GLOB, _CTX_PREFIX)
+    pcts.update(_read_int_glob(CTX_SESSION_GLOB, _CTX_SESSION_PREFIX))
     return pcts
+
+
+def gauge_for(snap: dict, gauges: dict):
+    """Look up a gauge for a run: cmux_surface first, then dashboard session id.
+
+    Grok seats have no cmux_surface; Claude under cmux has both (surface wins when both
+    exist so a hijacked/stale session key cannot override a live surface mirror)."""
+    surface = str(snap.get("cmux_surface", "")).upper()
+    if surface and surface in gauges:
+        return gauges[surface]
+    session = str(snap.get("session", "")).upper()
+    if session and session in gauges:
+        return gauges[session]
+    return None
 
 
 def ctx_cell(pct: "int | None", bar_cells: int = CTX_BAR_CELLS) -> tuple[str, tuple[str, ...]]:
@@ -463,10 +496,9 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], costs: dict[
                 else ("stale" if stale else "-"))
         base = ("dim",) if dim else ()
         sep = c(SEP, "dim")
-        surface = str(s.get("cmux_surface", "")).upper()
         mdisp, mcolor = model_cell(s.get("model", ""))
-        xdisp, xcolor = ctx_cell(ctxs.get(surface), bar_cells)
-        cdisp, ccolor = cost_cell(costs.get(surface))
+        xdisp, xcolor = ctx_cell(gauge_for(s, ctxs), bar_cells)
+        cdisp, ccolor = cost_cell(gauge_for(s, costs))
         line = sep.join([
             c(_cell(s.get("session", "?"), W_RUN), *base),
             c(_cell(ROLE_GLYPH.get(s.get("role", "other"), "-"), W_ROLE), *base),
@@ -493,9 +525,9 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], costs: dict[
     if overflow:
         body.append(c(f"… +{overflow} more (raise AGENT_DASHBOARD_MAX_ROWS)", "dim"))
 
-    # Total spend across the runs on screen. Cost is per Claude session, so a lane that
+    # Total spend across the runs on screen. Cost is per Claude/Grok session, so a lane that
     # has handed off to a fresh tab contributes only its current session's spend.
-    spend = sum(costs.get(str(s.get("cmux_surface", "")).upper()) or 0.0 for s in visible)
+    spend = sum(gauge_for(s, costs) or 0.0 for s in visible)
 
     title = ("agent dashboard  " + datetime.now().strftime("%H:%M:%S")
              + f"   active {len(active)}"
