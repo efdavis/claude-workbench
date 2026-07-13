@@ -54,14 +54,16 @@ STATE_COLOR = {
 }
 ROLE_GLYPH = {"planner": "P", "worker": "W", "reviewer": "R",
               "finisher": "F", "groomer": "G", "other": "-"}
-MODEL_COLOR = {"opus": ("magenta",), "sonnet": ("cyan",), "haiku": ("green",)}
+MODEL_COLOR = {"opus": ("magenta",), "sonnet": ("cyan",), "haiku": ("green",),
+               "grok": ("orange",)}
 
 
 def model_cell(model: str) -> tuple[str, tuple[str, ...]]:
     """Short display name + color for a model string; matches on family substring
-    so both 'opus' and 'claude-opus-4-8' render as 'opus'. Unknown -> raw + dim."""
+    so both 'opus' and 'claude-opus-4-8' render as 'opus'. Unknown -> raw + dim.
+    Not all runs are Claude: Eric's Grok seats emit model=grok."""
     m = (model or "").lower()
-    for fam in ("opus", "sonnet", "haiku"):
+    for fam in ("opus", "sonnet", "haiku", "grok"):
         if fam in m:
             return fam, MODEL_COLOR[fam]
     return (model or "-"), ("dim",)
