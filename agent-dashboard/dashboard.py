@@ -807,7 +807,8 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], costs: dict[
 
     lines.append("")
     sysl = sys_line()
-    footer = (f"{sysl}   " if sysl else "") + f"state:{STATE_DIR}   refresh:{REFRESH_SECS:g}s   Ctrl-C to quit"
+    footer = ((f"{sysl}   " if sysl else "")
+              + f"state:{STATE_DIR}   quota:{QUOTA_DIR}   refresh:{REFRESH_SECS:g}s   Ctrl-C to quit")
     lines.append(c(footer, "dim"))
     return "\033[H" + "".join(ln + "\033[K\n" for ln in lines) + "\033[J"
 
