@@ -15,7 +15,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Genericness gate (vendor-neutral, GitHub-native)
         run: ./agent-dashboard/check-generic.sh
-      - name: emit-status contract test
+      - name: Install jq (emit-status assertions)
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: agent-dashboard contract tests (pure shell/stdlib, shims cmux/tmux/git)
         run: |
-          sudo apt-get update && sudo apt-get install -y jq
           ./agent-dashboard/emit-status.test.sh
+          ./agent-dashboard/dashboard.test.sh
+          ./agent-dashboard/handler.test.sh
+          ./agent-dashboard/transcript.test.sh
+          ./agent-dashboard/dispatch.test.sh
