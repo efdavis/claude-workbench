@@ -147,6 +147,87 @@ def cost_cell(usd: "float | None") -> tuple[str, tuple[str, ...]]:
     return f"${usd:,.2f}", ("green",)
 
 
+# --- Accurate, subagent-inclusive cost via cost.py's transcript walk ---------------
+# The statusline mirror (read_costs) is Claude's own `total_cost_usd`: it under-reports
+# fan-out because it misses subagent/Workflow spend, and it freezes whenever the pane
+# stops rendering a statusline. cost.py reads the run's transcript (+ every nested
+# subagent transcript) and prices it at list rates — that IS the billing basis, so it's
+# accurate and can't go stale. We run it here, throttled, and let it override the mirror
+# per row; rows we can't resolve (no surface bridge, non-cmux, grok seats) keep the
+# mirror value. Vendor-neutral: a machine without cost.py just falls back to the mirror.
+COST_PY = Path(os.environ.get(
+    "AGENT_DASHBOARD_COST_PY",
+    str(Path(__file__).resolve().parent.parent / "cmux" / "cost.py")))
+SESSIONID_SURFACE_GLOB = "/tmp/claude-sessionid-surface-*.txt"
+_SESSIONID_SURFACE_PREFIX = "claude-sessionid-surface-"
+ACCURATE_COST_REFRESH_SECS = int(os.environ.get("AGENT_DASHBOARD_COST_REFRESH", "30"))
+_CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+_accurate_cost_cache: dict[str, float] = {}
+_accurate_cost_checked_at = 0.0
+
+
+def _surface_to_sessionid() -> dict[str, str]:
+    """UPPER(surface id) -> Claude session UUID, from the statusline bridge mirrors."""
+    out: dict[str, str] = {}
+    for path in glob.glob(SESSIONID_SURFACE_GLOB):
+        surface = os.path.basename(path)[len(_SESSIONID_SURFACE_PREFIX):-len(".txt")]
+        try:
+            uuid = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if uuid:
+            out[surface.upper()] = uuid
+    return out
+
+
+def _cost_for_session(uuid: str) -> "float | None":
+    """Accurate USD for one Claude session, subagents included, via cost.py. Locates the
+    project dir by globbing the UUID's top-level transcript (no slug math), then shells
+    out with a timeout. Any failure (no transcript, cost.py missing, bad JSON, timeout)
+    -> None so the caller falls back to the mirror. Never raises."""
+    matches = glob.glob(str(_CLAUDE_PROJECTS / "*" / f"{uuid}.jsonl"))
+    if not matches or not COST_PY.exists():
+        return None
+    project_dir = str(Path(matches[0]).parent)
+    try:
+        r = subprocess.run(
+            [sys.executable, str(COST_PY), "--project-dir", project_dir,
+             "--session", uuid, "--json"],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode != 0:
+            return None
+        total = json.loads(r.stdout).get("total_usd")
+        return float(total) if total is not None else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+
+
+def read_accurate_costs(snaps: list[dict], now: int | float) -> dict[str, float]:
+    """UPPER(surface id) -> accurate USD, for the non-terminal rows we can bridge to a
+    Claude session. Throttled to ACCURATE_COST_REFRESH_SECS (cost.py walks transcripts,
+    so it's not a per-2s-refresh cost); the cache paints between refreshes."""
+    global _accurate_cost_checked_at
+    now_f = float(now)
+    if _accurate_cost_cache and now_f - _accurate_cost_checked_at < ACCURATE_COST_REFRESH_SECS:
+        return dict(_accurate_cost_cache)
+    _accurate_cost_checked_at = now_f
+    bridge = _surface_to_sessionid()
+    fresh: dict[str, float] = {}
+    for s in snaps:
+        if s.get("state") in TERMINAL_STATES:
+            continue
+        surface = str(s.get("cmux_surface", "")).upper()
+        uuid = bridge.get(surface) if surface else None
+        if not uuid:
+            continue
+        usd = _cost_for_session(uuid)
+        if usd is not None:
+            fresh[surface] = usd
+    _accurate_cost_cache.clear()
+    _accurate_cost_cache.update(fresh)
+    return fresh
+
+
 CTX_GLOB = "/tmp/claude-context-pct-surface-*.txt"
 _CTX_PREFIX = "claude-context-pct-surface-"
 CTX_SESSION_GLOB = "/tmp/claude-context-pct-session-*.txt"
@@ -1027,8 +1108,11 @@ def _oneshot() -> int:
     """Non-tty (piped / contract test): render a single frame and exit."""
     now = int(time.time())
     w = shutil.get_terminal_size((120, 40)).columns
-    sys.stdout.write(render_frame(load_snapshots(), cmux_live(), tmux_lane_live(),
-                                  read_costs(), read_ctx(), now, w))
+    snaps = load_snapshots()
+    costs = read_costs()
+    costs.update(read_accurate_costs(snaps, now))
+    sys.stdout.write(render_frame(snaps, cmux_live(), tmux_lane_live(),
+                                  costs, read_ctx(), now, w))
     return 0
 
 
@@ -1076,6 +1160,7 @@ def main() -> int:
             snaps = load_snapshots()
             cmux, lanes = cmux_live(), tmux_lane_live()
             costs, ctxs = read_costs(), read_ctx()
+            costs.update(read_accurate_costs(snaps, now))  # accurate overrides mirror where resolvable
             order = [s.get("session") for s, _ in order_rows(snaps, now)]
             if sel_session not in order:
                 sel_session = order[0] if order else None

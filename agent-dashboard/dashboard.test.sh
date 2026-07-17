@@ -106,6 +106,22 @@ except Exception as e:
 finally:
     _os.unlink(_sh.name)
 
+# 9. accurate-cost path: best-effort, never fatal, and overlays the mirror where resolvable.
+import time as _time
+d._accurate_cost_cache.clear(); d._accurate_cost_checked_at = 0.0
+check(d.read_accurate_costs([], _time.time()) == {}, "no snaps -> no accurate costs")
+d._accurate_cost_cache.clear(); d._accurate_cost_checked_at = 0.0
+# a row with no cmux_surface can't be bridged to a session -> skipped, no crash
+check(d.read_accurate_costs([{"session": "s", "state": "implementing"}], _time.time()) == {},
+      "unbridgeable row -> skipped")
+# a bogus UUID has no transcript under ~/.claude/projects -> None (caller keeps the mirror)
+check(d._cost_for_session("00000000-0000-0000-0000-000000000000") is None,
+      "unknown session uuid -> None (mirror fallback)")
+# throttle: a warm cache paints between refreshes without re-shelling
+d._accurate_cost_cache.clear(); d._accurate_cost_cache["ABC"] = 42.0
+d._accurate_cost_checked_at = _time.time()
+check(d.read_accurate_costs([], _time.time()) == {"ABC": 42.0}, "warm cache paints under throttle")
+
 sys.exit(0 if ok else 1)
 PY
 then pass "unit/render checks passed"; else fail "unit/render checks"; fi

@@ -88,6 +88,11 @@ PY
 # $CMUX_SURFACE_ID but not its Claude session id, so this is the only join it has.
 [ -n "${CMUX_SURFACE_ID:-}" ] && echo "$COST_RAW" > "/tmp/claude-cost-usd-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
 [ -n "${CMUX_SURFACE_ID:-}" ] && echo "$PCT" > "/tmp/claude-context-pct-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
+# Surface -> Claude session UUID bridge. The $COST_RAW above is Claude's own
+# total_cost_usd, which under-reports fan-out (it misses subagent/Workflow spend); the
+# dashboard prices this run accurately by walking its transcript with cost.py, and this
+# is the only place surface id and the session UUID are both in hand to make that join.
+[ -n "${CMUX_SURFACE_ID:-}" ] && [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "/tmp/claude-sessionid-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
 # The 5-hour plan usage limit ("Current session" in claude.ai settings) + its reset epoch.
 # Account-wide, not per-session, so every session writes the same file and they agree;
 # whichever renders last wins. Guarded: older clients omit rate_limits -> PCT is -1, skip.
