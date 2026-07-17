@@ -8,8 +8,9 @@ the Orchestra, each run is a soloist, the dispatch lane spawner is the cue.
 
 It is a viewer that ROUTES, not a controller: a row cursor (j/k or arrows) plus three
 "open something" keys (Enter / p / t) that shell out to handler.sh (which owns every
-side effect — cmux tabs, tmux attach). dashboard.py itself mutates no run and holds no
-key. A malformed or half-written snapshot is skipped, never fatal.
+side effect — cmux tabs, tmux attach). dashboard.py mutates no live run; its only local
+write is the `r` key removing a finished/dead row's snapshot. A malformed or half-written
+snapshot is skipped, never fatal.
 
 Point it at the same state dir the emitter uses (AGENT_DASHBOARD_STATE_DIR, default
 ~/.claude/agent-dashboard/state) and leave it open in a pane while dispatch spawns lanes
@@ -18,7 +19,8 @@ on the private `tmux -L <socket>` socket (AGENT_DASHBOARD_TMUX_SOCKET).
 Pure stdlib on purpose — no pip install. Box-drawing panels + ANSI; honors NO_COLOR.
 
 Keys:  j/k or ↑/↓ move · Enter open (jump to a cmux run's tab / attach a live lane /
-       replay a finished one) · p open PR · t open issue · q or Ctrl-C quit
+       replay a finished one) · p open PR · t open issue · r reap (remove a dead/merged
+       row) · q or Ctrl-C quit
 Run:   python3 dashboard.py
 """
 from __future__ import annotations
@@ -43,12 +45,12 @@ STATE_DIR = Path(os.environ.get("AGENT_DASHBOARD_STATE_DIR",
                                 str(Path.home() / ".claude" / "agent-dashboard" / "state")))
 REFRESH_SECS = float(os.environ.get("AGENT_DASHBOARD_REFRESH", "2"))
 STALE_SECS = int(os.environ.get("AGENT_DASHBOARD_STALE_SECS", str(15 * 60)))
-TERMINAL_AGEOUT_SECS = int(os.environ.get("AGENT_DASHBOARD_AGEOUT_SECS", str(10 * 60)))
 MAX_WIDTH = int(os.environ.get("AGENT_DASHBOARD_MAX_WIDTH", "140"))
 MAX_ROWS = int(os.environ.get("AGENT_DASHBOARD_MAX_ROWS", "30"))
 # Private tmux socket dispatch spawns lanes on; overridable for tests / parallel setups.
 TMUX_SOCKET = os.environ.get("AGENT_DASHBOARD_TMUX_SOCKET", "agent-lanes")
 HANDLER = str(Path(__file__).resolve().parent / "handler.sh")
+EMIT = str(Path(__file__).resolve().parent / "emit-status.sh")
 
 TERMINAL_STATES = {"merged", "done"}
 COLOR = ("NO_COLOR" not in os.environ)
@@ -201,6 +203,25 @@ def pane_state(s: dict, cmux: set[str], lanes: set[str], now: int) -> str:
     return "stale" if age > STALE_SECS else "-"
 
 
+def reapable(s: dict, cmux: set[str], lanes: set[str], now: int) -> bool:
+    """Whether the `r` key may remove this row's card: a terminal (merged/done) row, or a
+    non-terminal one gone stale (no live pane past the threshold — the 💀 rows). A live or
+    ghost row is never reapable, so `r` can't yank a card out from under a running agent."""
+    return s.get("state") in TERMINAL_STATES or pane_state(s, cmux, lanes, now) == "stale"
+
+
+def reap_snapshot(session: str) -> str:
+    """The `r` action: remove one finished/dead row's snapshot through the single writer
+    (emit-status.sh --remove). Clears a card off the board; it never touches a live run."""
+    if not session:
+        return "no row selected"
+    try:
+        subprocess.run(["bash", EMIT, "--remove", "--session", session], timeout=8)
+        return f"reaped {session}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"reap failed: {e}"
+
+
 def humanize_age(epoch: int, now: int) -> str:
     d = max(0, now - int(epoch or 0))
     if d < 60:
@@ -269,19 +290,17 @@ _SEPS = 7  # single spaces between the 8 columns
 def order_rows(snaps: list[dict], now: int) -> list[tuple[dict, bool]]:
     """The rows in the exact order they render (and the cursor walks): escalated, then
     waiting-at-gate, then active — each oldest-first — then terminal (dimmed, newest
-    first). Aged-out terminal rows dropped; capped to MAX_ROWS. Returns (snap, dim)."""
-    visible = [s for s in snaps
-               if not (s.get("state") in TERMINAL_STATES
-                       and (now - int(s.get("epoch", 0))) > TERMINAL_AGEOUT_SECS)]
-    escalated = sorted([s for s in visible if s.get("state") == "escalated"],
+    first). Terminal rows persist until reaped with `r`; capped to MAX_ROWS. Returns
+    (snap, dim)."""
+    escalated = sorted([s for s in snaps if s.get("state") == "escalated"],
                        key=lambda s: int(s.get("epoch", 0)))
-    waiting = sorted([s for s in visible if s.get("state") == "waiting"],
+    waiting = sorted([s for s in snaps if s.get("state") == "waiting"],
                      key=lambda s: int(s.get("epoch", 0)))
-    active = sorted([s for s in visible
+    active = sorted([s for s in snaps
                      if s.get("state") not in TERMINAL_STATES
                      and s.get("state") not in ("escalated", "waiting")],
                     key=lambda s: int(s.get("epoch", 0)))
-    terminal = sorted([s for s in visible if s.get("state") in TERMINAL_STATES],
+    terminal = sorted([s for s in snaps if s.get("state") in TERMINAL_STATES],
                       key=lambda s: int(s.get("epoch", 0)), reverse=True)
     rendered = ([(s, False) for s in escalated + waiting + active]
                 + [(s, True) for s in terminal])
@@ -340,10 +359,7 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str], now: int,
         body.append("  " + c("no active runs — start a command or a dispatch lane", "dim"))
     for s, dim in rendered:
         add(s, dim=dim, selected=(s.get("session") == sel_session))
-    overflow = max(0, len([s for s in snaps
-                           if not (s.get("state") in TERMINAL_STATES
-                                   and (now - int(s.get("epoch", 0))) > TERMINAL_AGEOUT_SECS)])
-                   - len(rendered))
+    overflow = max(0, len(snaps) - len(rendered))
     if overflow:
         body.append("  " + c(f"… +{overflow} more (raise AGENT_DASHBOARD_MAX_ROWS)", "dim"))
 
@@ -373,7 +389,7 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str], now: int,
 
     lines.append("")
     sysl = sys_line()
-    keys = "j/k ↑↓ move · ⏎ open · p PR · t issue · q quit"
+    keys = "j/k ↑↓ move · ⏎ open · p PR · t issue · r reap · q quit"
     footer = (f"{sysl}   " if sysl else "") + f"{keys}   state:{STATE_DIR}   refresh:{REFRESH_SECS:g}s"
     lines.append(c(footer, "dim"))
     return "\033[H" + "".join(ln + "\033[K\n" for ln in lines) + "\033[J"
@@ -530,6 +546,16 @@ def main() -> int:
                 snap = by_id.get(sel_session)
                 act = "enter" if key in ("\r", "\n") else key
                 status_msg = dispatch_action(act, snap, cmux, lanes, now)
+            elif key == "r":
+                by_id = {s.get("session"): s for s, _ in order_rows(snaps, now)}
+                snap = by_id.get(sel_session)
+                if snap is None:
+                    status_msg = "no row selected"
+                elif reapable(snap, cmux, lanes, now):
+                    status_msg = reap_snapshot(snap.get("session", ""))
+                    sel_session = None  # row is gone; next refresh snaps the cursor to the top
+                else:
+                    status_msg = f"won't reap a live row ({snap.get('state', '?')}) — only merged/done/stale"
             else:
                 printable = key if key.isprintable() else repr(key)
                 status_msg = f"no action for '{printable}'"
