@@ -64,7 +64,7 @@ Shared reference docs used by several skills live in [`commands/references/`](co
 
 ## Agent dashboard
 
-[`agent-dashboard/`](agent-dashboard/) is a live, read-only terminal view of your agent runs. Leave `agent-dashboard/run.sh` open in one pane and watch `implement` / `code-review` / `pr-prep` / `babysit-pr` (or a whole `/ship`) work in others — which issue, which role, what state, how long, and which ones need you. It only observes; you drive the runs. Pure stdlib Python 3, no daemon, no `pip install`.
+[`agent-dashboard/`](agent-dashboard/) is a live terminal view of, and index into, your agent runs. Leave `agent-dashboard/run.sh` open in one pane and watch `implement` / `code-review` / `pr-prep` / `babysit-pr` (or a whole `/ship`) work in others — which issue, which role, what state, how long, and which ones need you. It observes and navigates (a row cursor + one-key jump to attach a live run or replay a finished one); you drive the runs. Pure stdlib Python 3, no daemon, no `pip install`. `dispatch.sh` is the optional spawn half: claim an issue, cut a `git worktree`, and launch a detached lane the dashboard then tracks.
 
 The commands emit status best-effort at each phase (their "Dashboard status" sections). For them to find the emitter from inside your project, put it on `PATH` or set `AGENT_DASHBOARD_HOME`:
 

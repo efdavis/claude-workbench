@@ -1,5 +1,5 @@
 #!/bin/bash
-# statusline.sh — Claude Code statusline: ticket/task | context % | cost
+# statusline.sh — Claude Code statusline: ticket/task | model·effort | context % | cost
 #
 # This is the *producer* half of the dashboard's data contract. Claude Code pipes a JSON
 # blob into this script on every render (a shell hook — no model call, so nothing here
@@ -9,10 +9,18 @@
 # Install: copy to ~/.claude/statusline.sh and point settings.json at it:
 #   "statusLine": { "type": "command", "command": "bash ~/.claude/statusline.sh" }
 #
+# Label precedence: session name → Claude-written context file → git branch → dir name.
+# Optionally restrict ticket detection to specific project keys, e.g.:
+#   export STATUSLINE_TICKET_KEYS="ABC|XYZ"
+# Empty (default) matches any uppercase Jira-style key (ABC-123).
+#
 # Everything is best-effort by contract, same as emit-status.sh: a failed write is
 # silently skipped and the dashboard just renders "-" for that cell. It can never break
-# the session it observes.
+# the session it observes. Requires: jq.
 input=$(cat)
+
+# Restrict ticket detection to these project keys (pipe-separated), or match any key.
+TICKET_KEYS="${STATUSLINE_TICKET_KEYS:-}"
 
 # Parse JSON fields in one jq call
 eval "$(echo "$input" | jq -r '
@@ -21,6 +29,9 @@ eval "$(echo "$input" | jq -r '
   @sh "PROJECT_DIR=\(.workspace.project_dir // .cwd // "")",
   @sh "SESSION_NAME=\(.session_name // "")",
   @sh "SESSION_ID=\(.session_id // "")",
+  @sh "MODEL_ID=\(.model.id // "")",
+  @sh "MODEL_NAME=\(.model.display_name // "")",
+  @sh "EFFORT=\(.effort.level // "")",
   @sh "RL5_PCT=\(.rate_limits.five_hour.used_percentage // -1 | floor)",
   @sh "RL5_RESET=\(.rate_limits.five_hour.resets_at // 0 | floor)",
   @sh "RL7_PCT=\(.rate_limits.seven_day.used_percentage // -1 | floor)",
@@ -89,7 +100,12 @@ PY
 TICKET=""
 DESC=""
 
-# A ticket id is any ABC-123 prefix; adjust the pattern if your tracker differs.
+# A ticket id is any ABC-123 prefix (or one of $TICKET_KEYS if set).
+if [ -n "$TICKET_KEYS" ]; then
+  KEY_RE="($TICKET_KEYS)-([0-9]+)"
+else
+  KEY_RE="([A-Z]+)-([0-9]+)"
+fi
 TICKET_RE='^([A-Z]+-[0-9]+)[[:space:]-]*(.*)'
 
 if [ -n "$SESSION_NAME" ]; then
@@ -100,7 +116,9 @@ if [ -n "$SESSION_NAME" ]; then
     DESC="$SESSION_NAME"
   fi
 else
-  # Claude-written context file — per-session first, fall back to per-project
+  # Claude-written context file — per-session first, fall back to per-project.
+  # An optional UserPromptSubmit hook can write a "TICKET short-description" label to
+  # /tmp/claude-statusline-ctx-<session_id>.txt so the bar tracks the live topic.
   SESSION_CTX_FILE=""
   [ -n "$SESSION_ID" ] && SESSION_CTX_FILE="/tmp/claude-statusline-ctx-$SESSION_ID.txt"
   PROJECT_CTX_FILE="/tmp/claude-statusline-ctx-$(echo -n "$PROJECT_DIR" | md5 -q 2>/dev/null || md5sum 2>/dev/null | cut -d' ' -f1)"
@@ -123,9 +141,10 @@ else
     BRANCH=""
     [ -n "$PROJECT_DIR" ] && BRANCH=$(git -C "$PROJECT_DIR" symbolic-ref --short HEAD 2>/dev/null) || true
     if [ -n "$BRANCH" ]; then
-      if [[ "$BRANCH" =~ $TICKET_RE ]]; then
-        TICKET="${BASH_REMATCH[1]}"
-        DESC="${BASH_REMATCH[2]}"
+      if [[ "$BRANCH" =~ $KEY_RE ]]; then
+        TICKET="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+        DESC="${BRANCH##*${TICKET}}"
+        DESC="${DESC#-}"
         [ ${#DESC} -gt 25 ] && DESC="${DESC:0:22}..."
       else
         DESC="$BRANCH"
@@ -152,6 +171,24 @@ C_SEP='\e[38;5;240m'     # dim gray separator
 C_COST='\e[38;5;114m'    # soft green
 RST='\e[0m'
 
+# --- Model + effort chip ---
+C_EFF='\e[38;5;245m'                       # mid gray (effort)
+MODEL_SHORT=""
+MODEL_COLOR='\e[38;5;245m'                 # neutral fallback
+case "$MODEL_ID" in
+  *opus*)   MODEL_SHORT="opus";   MODEL_COLOR='\e[38;2;74;163;255m'  ;;  # blue
+  *sonnet*) MODEL_SHORT="sonnet"; MODEL_COLOR='\e[38;2;45;212;191m'  ;;  # teal
+  *fable*)  MODEL_SHORT="fable";  MODEL_COLOR='\e[38;2;157;92;255m'  ;;  # deep purple
+  *haiku*)  MODEL_SHORT="haiku";  MODEL_COLOR='\e[38;2;74;222;128m'  ;;  # green
+  *)        MODEL_SHORT=$(printf '%s' "$MODEL_NAME" | awk '{print tolower($1)}') ;;
+esac
+
+CHIP=""
+if [ -n "$MODEL_SHORT" ]; then
+  CHIP="${MODEL_COLOR}\e[1m${MODEL_SHORT}${RST}"
+  [ -n "$EFFORT" ] && CHIP+="${C_SEP}·${RST}${C_EFF}${EFFORT}${RST}"
+fi
+
 # --- Build output ---
 OUT=""
 if [ -n "$TICKET" ] && [ -n "$DESC" ]; then
@@ -163,6 +200,9 @@ elif [ -n "$DESC" ]; then
 else
   OUT+="${C_DESC}\e[1mclaude${RST}"
 fi
+
+# Separator + model·effort chip (between summary and context %)
+[ -n "$CHIP" ] && OUT+="  ${C_SEP}|${RST}  ${CHIP}"
 
 OUT+="  ${C_SEP}|${RST}  ${CTX_COLOR}${PCT}%${RST}"
 

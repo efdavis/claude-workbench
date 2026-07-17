@@ -2,8 +2,9 @@
 
 My [cmux](https://cmux.com) terminal UI and settings. cmux is a Ghostty-based
 terminal; its appearance comes from a Ghostty config plus a cmux app-settings
-file. This folder carries the two files I hand-edit. The color theme is managed
-by a cmux CLI command (documented below), not by a tracked file.
+file. This folder carries the files I hand-edit, plus the Claude Code statusline
+that renders inside the terminal. The color theme is managed by a cmux CLI
+command (documented below), not by a tracked file.
 
 ## Files
 
@@ -11,6 +12,8 @@ by a cmux CLI command (documented below), not by a tracked file.
 |------|----------------|--------------|
 | `ghostty-config` | `~/.config/ghostty/config` | Font size, foreground brightening. cmux reads this for terminal appearance. |
 | `cmux.json` | `~/.config/cmux/cmux.json` | Dark chrome (force dark mode), navy sidebar tint. |
+| `../agent-dashboard/statusline.sh` | `~/.claude/statusline.sh` | Claude Code statusline: ticket/task · model·effort · context % · cost. Lives with its consumer (it is the dashboard's data-contract producer); symlinked in from here. Also needs a one-line `statusLine` entry in `~/.claude/settings.json` (see [Statusline](#statusline)). |
+| `cost.py` | none (run in place) | Token-dollar accounting for a Claude Code session or project, read from local transcripts. Breaks out subagent / Workflow-agent spend (see [Cost accounting](#cost-accounting)). |
 
 The theme (`TokyoNight Storm`) is stored separately in
 `~/Library/Application Support/com.cmuxterm.app/config.ghostty`, written by the
@@ -31,11 +34,23 @@ mkdir -p ~/.config/ghostty ~/.config/cmux
 ln -sf ~/Projects/claude-workbench/cmux/ghostty-config ~/.config/ghostty/config
 ln -sf ~/Projects/claude-workbench/cmux/cmux.json ~/.config/cmux/cmux.json
 
+# Statusline: symlink the script, then point Claude Code at it (see Statusline below)
+ln -sf ~/Projects/claude-workbench/agent-dashboard/statusline.sh ~/.claude/statusline.sh
+
 # Set the theme (writes both light and dark slots — see gotcha below)
 cmux themes set "TokyoNight Storm"
 
 # Apply everything live, no app restart
 cmux reload-config
+```
+
+Then add the `statusLine` block to `~/.claude/settings.json` (it can't be
+symlinked in — it's one key inside your existing settings):
+
+```json
+{
+  "statusLine": { "type": "command", "command": "bash ~/.claude/statusline.sh" }
+}
 ```
 
 ## What this gives you
@@ -49,6 +64,52 @@ cmux reload-config
   dark even when the OS is in light mode.
 * **Sidebar**: tinted navy with the terminal background instead of the default
   black tint.
+
+## Statusline
+
+`statusline.sh` is a Claude Code statusline (a `statusLine` command in
+`~/.claude/settings.json`), not a cmux setting — it just happens to render inside
+this terminal. Requires `jq`. It reads the JSON Claude Code pipes in and prints a
+single line:
+
+```
+TICKET description  |  model·effort  |  context %  |  cost
+```
+
+* **Label** resolves in order: session name → a Claude-written context file →
+  git branch → directory name. The first match wins.
+* **Context file** (optional): if a `UserPromptSubmit` hook writes a
+  `TICKET short-description` label to `/tmp/claude-statusline-ctx-<session_id>.txt`,
+  the bar tracks the live topic instead of the branch. Without the hook it falls
+  back to the branch name — no setup required.
+* **Ticket detection** matches any uppercase Jira-style key (`ABC-123`) by
+  default. To restrict it to your own project keys, export a pipe-separated list:
+  `export STATUSLINE_TICKET_KEYS="ABC|XYZ"`.
+* **Model chip** is colored per family (opus/sonnet/fable/haiku); anything else
+  falls back to the lowercased display name. **Context %** goes green → yellow →
+  orange → red as it fills. **Cost** is hidden while it's `$0.00`.
+
+## Cost accounting
+
+`cost.py` sums the token usage Claude Code records in your local session
+transcripts and prices it at Anthropic list rates. No network, no API calls; it
+only reads files. Needs Python 3, no dependencies. Run it in place:
+
+```bash
+# current project (cwd), all sessions
+python3 ~/Projects/claude-workbench/cmux/cost.py
+# one session, or bucketed by day, or as JSON
+python3 ~/Projects/claude-workbench/cmux/cost.py --session <uuid>
+python3 ~/Projects/claude-workbench/cmux/cost.py --by-day
+python3 ~/Projects/claude-workbench/cmux/cost.py --json
+```
+
+Subagents (the Task tool) and Workflow agents write their own transcripts in a
+nested directory, so a naive top-level scan under-reports fan-out-heavy
+sessions, sometimes by the majority of spend. `cost.py` walks the nested
+transcripts and prints the spawned-agent total on its own line so the fan-out
+cost is visible. Figures are list price, for relative comparison and budgeting,
+not an invoice.
 
 ## Gotchas
 
