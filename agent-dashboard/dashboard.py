@@ -7,9 +7,11 @@ role, what state, how long, and which ones need you (escalations).
 
 Read-only and best-effort by design: it never mutates a run, and a malformed or
 half-written snapshot is skipped, never fatal. Point it at the same state dir the
-emitter uses (AGENT_DASHBOARD_STATE_DIR, default ~/.claude/agent-dashboard/state)
-and leave it open in a pane while you drive implement / babysit-pr / code-review
-in others.
+emitter uses (AGENT_DASHBOARD_STATE_DIR, default
+~/Projects/claude-workbench/agent-dashboard/state) and leave it open in a pane
+while you drive implement / babysit-pr / code-review in others. Account-wide
+quota mirrors (claude/codex/grok 5h+7d) live under the sibling quota/ dir and
+are dual-written to /tmp for back-compat.
 
 Pure stdlib on purpose — no pip install. Box-drawing panels + ANSI; honors NO_COLOR.
 
@@ -28,8 +30,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Shared harness home under ~/Projects so every project (Emberfall, etc.) sees
+# the same board + durable quota. Override with AGENT_DASHBOARD_HOME.
+_DASHBOARD_HOME = Path(os.environ.get(
+    "AGENT_DASHBOARD_HOME",
+    str(Path.home() / "Projects" / "claude-workbench" / "agent-dashboard"),
+)).expanduser()
 STATE_DIR = Path(os.environ.get("AGENT_DASHBOARD_STATE_DIR",
-                                str(Path.home() / ".claude" / "agent-dashboard" / "state")))
+                                str(_DASHBOARD_HOME / "state"))).expanduser()
+QUOTA_DIR = Path(os.environ.get("AGENT_DASHBOARD_QUOTA_DIR",
+                                str(_DASHBOARD_HOME / "quota"))).expanduser()
 # Optional pilot-light sidecar (see ../../emberfall/pilot-light). When this points
 # at a configured pilot-light dir, the dashboard co-launches its loop.sh and shows
 # a pilot panel. Unset -> the dashboard is exactly its old view-only self.
@@ -180,22 +190,142 @@ def ctx_cell(pct: "int | None", bar_cells: int = CTX_BAR_CELLS) -> tuple[str, tu
     return f"{bar}{pct:>3}%", color
 
 
-RATE_LIMIT_FILE = "/tmp/claude-rate-limit-5h.txt"
+# Account-wide quota mirrors — durable under QUOTA_DIR, dual-written to /tmp so
+# older readers (and anything that still greps /tmp) keep working.
+# Claude: statusline.sh from rate_limits.five_hour / seven_day.
+# Codex: dashboard refreshes from ChatGPT wham/usage (or latest rollout fallback).
+# Grok: optional mirror only (no stable public weekly % API yet) — dashboard shows "—".
+RATE_LIMIT_QUOTA = "claude-5h.txt"       # durable name
+RATE_LIMIT_TMP = "/tmp/claude-rate-limit-5h.txt"
+CLAUDE_WEEKLY_QUOTA = "claude-7d.txt"
+CLAUDE_WEEKLY_TMP = "/tmp/claude-rate-limit-7d.txt"
+CODEX_WEEKLY_QUOTA = "codex-7d.txt"
+CODEX_WEEKLY_TMP = "/tmp/codex-rate-limit-7d.txt"
+GROK_WEEKLY_QUOTA = "grok-7d.txt"
+GROK_WEEKLY_TMP = "/tmp/grok-rate-limit-7d.txt"
+# Back-compat aliases used by weekly_quota_line / ensure_codex paths below.
+CLAUDE_WEEKLY_FILE = CLAUDE_WEEKLY_TMP
+CODEX_WEEKLY_FILE = CODEX_WEEKLY_TMP
+GROK_WEEKLY_FILE = GROK_WEEKLY_TMP
+RATE_LIMIT_FILE = RATE_LIMIT_TMP
+CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Don't hammer OpenAI on every 2s refresh; 60s is plenty for a weekly bar.
+CODEX_WEEKLY_REFRESH_SECS = int(os.environ.get("AGENT_DASHBOARD_CODEX_WEEKLY_REFRESH", "60"))
 QUOTA_BAR_CELLS = 10
 # The 5-hour plan usage limit ("Current session" in claude.ai settings) — this is the one
 # that actually stops work when it hits 100, so RED starts well before the wall.
 QUOTA_WARN, QUOTA_HOT, QUOTA_CRIT = 50, 75, 90
+_codex_weekly_checked_at = 0.0
+
+
+def _quota_path(name: str) -> Path:
+    return QUOTA_DIR / name
+
+
+def read_pct_reset(path: str | Path) -> "tuple[int, int] | None":
+    """(usage %, reset epoch) from a two-field mirror file. Unreadable/absent -> None."""
+    try:
+        pct, reset = Path(path).read_text().split()
+        return int(float(pct)), int(float(reset))
+    except (OSError, ValueError):
+        return None
+
+
+def read_quota(durable_name: str, tmp_path: str) -> "tuple[int, int] | None":
+    """Prefer durable Projects/quota mirror; fall back to /tmp (live statusline)."""
+    return read_pct_reset(_quota_path(durable_name)) or read_pct_reset(tmp_path)
 
 
 def read_rate_limit() -> "tuple[int, int] | None":
     """(5h usage %, reset epoch) as mirrored by statusline.sh from Claude's own
     rate_limits payload. Account-wide, so any session's mirror speaks for all of them.
     Same best-effort contract as the other readers: unreadable/absent -> None."""
+    return read_quota(RATE_LIMIT_QUOTA, RATE_LIMIT_TMP)
+
+
+def _write_pct_reset(path: str | Path, pct: int, reset: int) -> None:
+    """Write one mirror file. Best-effort; never raises."""
     try:
-        pct, reset = Path(RATE_LIMIT_FILE).read_text().split()
-        return int(pct), int(reset)
-    except (OSError, ValueError):
-        return None
+        p = Path(path)
+        if p.parent and str(p.parent) not in ("", "."):
+            p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{int(pct)} {int(reset)}\n")
+    except OSError:
+        pass
+
+
+def _update_quota_snapshot(key: str, pct: int, reset: int) -> None:
+    """Refresh quota/snapshot.json so humans can eyeball last-known harness %.
+
+    Best-effort; never raises. Keys: claude_5h, claude_7d, codex_7d, grok_7d.
+    """
+    snap_path = _quota_path("snapshot.json")
+    try:
+        try:
+            snap = json.loads(snap_path.read_text())
+            if not isinstance(snap, dict):
+                snap = {}
+        except (OSError, ValueError):
+            snap = {}
+        snap["updated_at"] = int(time.time())
+        snap[key] = {"pct": int(pct), "reset_epoch": int(reset)}
+        sources = snap.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+        sources[key] = str(_quota_path({
+            "claude_5h": RATE_LIMIT_QUOTA,
+            "claude_7d": CLAUDE_WEEKLY_QUOTA,
+            "codex_7d": CODEX_WEEKLY_QUOTA,
+            "grok_7d": GROK_WEEKLY_QUOTA,
+        }.get(key, key + ".txt")))
+        snap["sources"] = sources
+        snap_path.parent.mkdir(parents=True, exist_ok=True)
+        snap_path.write_text(json.dumps(snap, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def write_quota(durable_name: str, tmp_path: str, pct: int, reset: int,
+                snapshot_key: str | None = None) -> None:
+    """Dual-write durable Projects/quota + /tmp mirror. Best-effort."""
+    _write_pct_reset(_quota_path(durable_name), pct, reset)
+    _write_pct_reset(tmp_path, pct, reset)
+    if snapshot_key:
+        _update_quota_snapshot(snapshot_key, pct, reset)
+
+
+def _quota_color(pct: int) -> tuple[str, ...]:
+    if pct > QUOTA_CRIT:
+        return ("bold", "red")
+    if pct > QUOTA_HOT:
+        return ("orange",)
+    if pct > QUOTA_WARN:
+        return ("yellow",)
+    return ("green",)
+
+
+def _format_resets(reset: int, now: int) -> str:
+    left = max(0, reset - now)
+    if left >= 86400:
+        d, rem = divmod(left, 86400)
+        return f"{d}d{rem // 3600:02d}h"
+    if left >= 3600:
+        return f"{left // 3600}h{(left % 3600) // 60:02d}m"
+    return f"{left // 60}m"
+
+
+def format_quota_bar(label: str, pct: int, reset: int, now: int,
+                     name_styles: tuple[str, ...] = ()) -> str:
+    """One compact quota cell: 'claude 7d ███░░░░░░░ 42% · 3d04h'."""
+    pct = max(0, min(100, pct))
+    color = _quota_color(pct)
+    filled = round(pct / 100 * QUOTA_BAR_CELLS)
+    bar = c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
+    name = c(label, *name_styles) if name_styles else c(label, "dim")
+    return (name + " " + bar + " " + c(f"{pct}%", *color)
+            + c(f" · {_format_resets(reset, now)}", "dim"))
 
 
 def quota_cell(now: int) -> str:
@@ -206,20 +336,139 @@ def quota_cell(now: int) -> str:
         return ""
     pct, reset = rl
     pct = max(0, min(100, pct))
-    if pct > QUOTA_CRIT:
-        color = ("bold", "red")
-    elif pct > QUOTA_HOT:
-        color = ("orange",)
-    elif pct > QUOTA_WARN:
-        color = ("yellow",)
-    else:
-        color = ("green",)
+    color = _quota_color(pct)
     filled = round(pct / 100 * QUOTA_BAR_CELLS)
     bar = c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
-    left = max(0, reset - now)
-    resets = f"{left // 3600}h{(left % 3600) // 60:02d}m" if left >= 3600 else f"{left // 60}m"
     return (c("5h ", "dim") + bar + " " + c(f"{pct}% used", *color)
-            + c(f" · resets {resets}", "dim"))
+            + c(f" · resets {_format_resets(reset, now)}", "dim"))
+
+
+def _refresh_codex_weekly_from_api() -> bool:
+    """Pull Codex weekly (primary window) % from ChatGPT wham/usage. Returns True on write."""
+    try:
+        auth = json.loads(CODEX_AUTH_FILE.read_text())
+    except (OSError, ValueError):
+        return False
+    tokens = auth.get("tokens") or {}
+    access = tokens.get("access_token")
+    if not access:
+        return False
+    account_id = tokens.get("account_id") or ""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            CODEX_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {access}",
+                "Content-Type": "application/json",
+                "User-Agent": "agent-dashboard",
+                **({"ChatGPT-Account-ID": account_id} if account_id else {}),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    window = (data.get("rate_limit") or {}).get("primary_window") or {}
+    try:
+        pct = int(float(window["used_percent"]))
+        reset = int(float(window.get("reset_at")
+                          or (time.time() + float(window.get("reset_after_seconds", 0)))))
+    except (KeyError, TypeError, ValueError):
+        return False
+    write_quota(CODEX_WEEKLY_QUOTA, CODEX_WEEKLY_TMP, pct, reset, "codex_7d")
+    return True
+
+
+def _refresh_codex_weekly_from_rollouts() -> bool:
+    """Fallback: newest payload.rate_limits.primary in ~/.codex/sessions rollouts."""
+    if not CODEX_SESSIONS_DIR.is_dir():
+        return False
+    # sessions/YYYY/MM/DD/rollout-*.jsonl — take the newest few files by mtime.
+    try:
+        rollouts = sorted(
+            CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:8]
+    except OSError:
+        return False
+    for path in rollouts:
+        try:
+            # Tail-scan: rate_limits appear often; last write wins.
+            with path.open("r", errors="ignore") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in reversed(lines[-200:]):
+            if "rate_limits" not in line or "used_percent" not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            # Walk for {used_percent, resets_at} under rate_limits.primary
+            stack = [obj]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    rl = cur.get("rate_limits")
+                    if isinstance(rl, dict):
+                        primary = rl.get("primary")
+                        if isinstance(primary, dict) and "used_percent" in primary:
+                            try:
+                                pct = int(float(primary["used_percent"]))
+                                reset = int(float(primary.get("resets_at")
+                                                  or primary.get("reset_at") or 0))
+                                if reset <= 0:
+                                    continue
+                                write_quota(CODEX_WEEKLY_QUOTA, CODEX_WEEKLY_TMP,
+                                            pct, reset, "codex_7d")
+                                return True
+                            except (TypeError, ValueError):
+                                pass
+                    stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+    return False
+
+
+def ensure_codex_weekly_fresh(now: int | float | None = None) -> None:
+    """Best-effort refresh of the Codex weekly mirror. Throttled; never raises."""
+    global _codex_weekly_checked_at
+    now_f = float(now if now is not None else time.time())
+    if now_f - _codex_weekly_checked_at < CODEX_WEEKLY_REFRESH_SECS:
+        # Still refresh if both durable and /tmp mirrors are missing.
+        if _quota_path(CODEX_WEEKLY_QUOTA).exists() or Path(CODEX_WEEKLY_TMP).exists():
+            return
+    _codex_weekly_checked_at = now_f
+    if _refresh_codex_weekly_from_api():
+        return
+    _refresh_codex_weekly_from_rollouts()
+
+
+def weekly_quota_line(now: int) -> str:
+    """One line under the title: weekly bars for claude · codex · grok.
+
+    Always renders three slots so the layout is stable; unknown values show as '—'.
+    Colors match MODEL_COLOR families (claude white, codex teal, grok orange).
+    Reads durable Projects/quota first, then /tmp."""
+    ensure_codex_weekly_fresh(now)
+    slots = (
+        ("claude", CLAUDE_WEEKLY_QUOTA, CLAUDE_WEEKLY_TMP, ()),
+        ("codex", CODEX_WEEKLY_QUOTA, CODEX_WEEKLY_TMP, MODEL_COLOR["codex"]),
+        ("grok", GROK_WEEKLY_QUOTA, GROK_WEEKLY_TMP, MODEL_COLOR["grok"]),
+    )
+    parts: list[str] = []
+    for name, durable, tmp, name_styles in slots:
+        rl = read_quota(durable, tmp)
+        if rl is None:
+            label = c(name, *(name_styles or ("dim",)))
+            parts.append(label + c(" 7d —", "dim"))
+        else:
+            pct, reset = rl
+            parts.append(format_quota_bar(f"{name} 7d", pct, reset, now, name_styles))
+    return "   ".join(parts)
 
 
 def c(text: str, *styles: str) -> str:
@@ -536,8 +785,12 @@ def render_frame(snaps: list[dict], live: set[str], cmux: set[str], costs: dict[
              + f"   done {len(terminal)}"
              + (f"   spend ${spend:,.2f}" if spend else ""))
     quota = quota_cell(now)
+    weekly = weekly_quota_line(now)
 
-    lines: list[str] = [c(title, "bold") + (("   " + quota) if quota else ""), ""]
+    lines: list[str] = [c(title, "bold") + (("   " + quota) if quota else "")]
+    if weekly:
+        lines.append(weekly)
+    lines.append("")
     lines += panel("runs", body, width)
 
     if PILOT_DIR is not None:

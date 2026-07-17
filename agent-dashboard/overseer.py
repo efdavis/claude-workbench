@@ -34,8 +34,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 EMIT = HERE / "emit-status.sh"
+_DASHBOARD_HOME = Path(os.environ.get(
+    "AGENT_DASHBOARD_HOME",
+    str(Path.home() / "Projects" / "claude-workbench" / "agent-dashboard"),
+)).expanduser()
 STATE_DIR = Path(os.environ.get("AGENT_DASHBOARD_STATE_DIR",
-                                str(Path.home() / ".claude" / "agent-dashboard" / "state")))
+                                str(_DASHBOARD_HOME / "state"))).expanduser()
 TERMINAL_STATES = {"merged", "done"}
 
 

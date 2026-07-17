@@ -22,13 +22,54 @@ eval "$(echo "$input" | jq -r '
   @sh "SESSION_NAME=\(.session_name // "")",
   @sh "SESSION_ID=\(.session_id // "")",
   @sh "RL5_PCT=\(.rate_limits.five_hour.used_percentage // -1 | floor)",
-  @sh "RL5_RESET=\(.rate_limits.five_hour.resets_at // 0 | floor)"
+  @sh "RL5_RESET=\(.rate_limits.five_hour.resets_at // 0 | floor)",
+  @sh "RL7_PCT=\(.rate_limits.seven_day.used_percentage // -1 | floor)",
+  @sh "RL7_RESET=\(.rate_limits.seven_day.resets_at // 0 | floor)"
 ' 2>/dev/null)" 2>/dev/null || {
   printf '\e[31m??\e[0m'
   exit 0
 }
 
 # --- Mirrors: the dashboard's data contract (see dashboard.py) ---
+# Account-wide quotas are dual-written: durable under Projects (survives reboot) +
+# /tmp (back-compat for anything still grepping there). Per-session context/cost
+# stay /tmp-only — those are live-session telemetry, not harness history.
+#
+# Harness home (shared by every project, including Emberfall):
+#   ${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}
+#   quota/claude-5h.txt  quota/claude-7d.txt  (+ snapshot.json updated on write)
+_AD_HOME="${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}"
+_AD_QUOTA="${AGENT_DASHBOARD_QUOTA_DIR:-$_AD_HOME/quota}"
+mkdir -p "$_AD_QUOTA" 2>/dev/null || true
+
+_write_quota() {
+  # $1=durable basename  $2=/tmp path  $3=pct  $4=reset  $5=snapshot key
+  local durable="$1" tmp="$2" pct="$3" reset="$4" key="${5:-}"
+  printf '%s %s\n' "$pct" "$reset" > "$tmp" 2>/dev/null || true
+  printf '%s %s\n' "$pct" "$reset" > "$_AD_QUOTA/$durable" 2>/dev/null || true
+  if [ -n "$key" ]; then
+    # Lightweight snapshot patch via python3 if available; never block statusline.
+    command -v python3 >/dev/null 2>&1 && python3 - "$_AD_QUOTA" "$key" "$pct" "$reset" "$_AD_QUOTA/$durable" <<'PY' 2>/dev/null || true
+import json, sys, time
+from pathlib import Path
+qdir, key, pct, reset, src = sys.argv[1:6]
+path = Path(qdir) / "snapshot.json"
+try:
+    snap = json.loads(path.read_text()) if path.is_file() else {}
+    if not isinstance(snap, dict):
+        snap = {}
+except Exception:
+    snap = {}
+snap["updated_at"] = int(time.time())
+snap[key] = {"pct": int(float(pct)), "reset_epoch": int(float(reset))}
+sources = snap.get("sources") if isinstance(snap.get("sources"), dict) else {}
+sources[key] = src
+snap["sources"] = sources
+path.write_text(json.dumps(snap, indent=2) + "\n")
+PY
+  fi
+}
+
 # Context % and cost, per session — so a session can self-check its own budget.
 [ -n "$SESSION_ID" ] && echo "$PCT" > "/tmp/claude-context-pct-$SESSION_ID.txt" 2>/dev/null
 [ -n "$SESSION_ID" ] && echo "$COST_RAW" > "/tmp/claude-cost-usd-$SESSION_ID.txt" 2>/dev/null
@@ -39,7 +80,9 @@ eval "$(echo "$input" | jq -r '
 # The 5-hour plan usage limit ("Current session" in claude.ai settings) + its reset epoch.
 # Account-wide, not per-session, so every session writes the same file and they agree;
 # whichever renders last wins. Guarded: older clients omit rate_limits -> PCT is -1, skip.
-[ "${RL5_PCT:--1}" -ge 0 ] 2>/dev/null && echo "$RL5_PCT $RL5_RESET" > /tmp/claude-rate-limit-5h.txt 2>/dev/null
+[ "${RL5_PCT:--1}" -ge 0 ] 2>/dev/null && _write_quota claude-5h.txt /tmp/claude-rate-limit-5h.txt "$RL5_PCT" "$RL5_RESET" claude_5h
+# Weekly (7-day) plan usage limit ("Current week" in claude.ai settings). Same contract as 5h.
+[ "${RL7_PCT:--1}" -ge 0 ] 2>/dev/null && _write_quota claude-7d.txt /tmp/claude-rate-limit-7d.txt "$RL7_PCT" "$RL7_RESET" claude_7d
 
 # --- Ticket/task label ---
 # Resolution order: the session name, then a Claude-written context file, then the branch.

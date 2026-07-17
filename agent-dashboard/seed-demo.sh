@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Seed a handful of demo snapshots so you can watch the dashboard populate without
-# real agent runs. Writes to ${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}
+# real agent runs. Writes to
+# ${AGENT_DASHBOARD_STATE_DIR:-${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}/state}
 # with demo-* session ids (easy to clear). Then run ./run.sh in another pane.
 #
 #   ./seed-demo.sh          # seed
@@ -8,7 +9,8 @@
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 E="$here/emit-status.sh"
-dir="${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}"
+_ad_home="${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}"
+dir="${AGENT_DASHBOARD_STATE_DIR:-$_ad_home/state}"
 
 if [ "${1:-}" = "--clear" ]; then
   rm -f "$dir"/demo-*.json 2>/dev/null

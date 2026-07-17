@@ -25,7 +25,7 @@ Two moving parts, joined by a filesystem convention:
 
 - **`emit-status.sh`** — a tiny bash helper the commands call at each phase boundary. It writes one
   atomic JSON snapshot per run (built with python3 stdlib — no `jq` or other dependency) to
-  `${AGENT_DASHBOARD_STATE_DIR:-~/.claude/agent-dashboard/state}/<session>.json` (schema:
+  `${AGENT_DASHBOARD_STATE_DIR:-~/Projects/claude-workbench/agent-dashboard/state}/<session>.json` (schema:
   [`status.schema.json`](./status.schema.json)). **Best-effort by contract:** if it's absent or the
   state dir is unwritable it silently no-ops, so it can never break the run it observes.
 - **`dashboard.py`** — polls that state dir (+ tmux/cmux for pane liveness: cmux rows match the
@@ -34,13 +34,24 @@ Two moving parts, joined by a filesystem convention:
 - **`statusline.sh`** — a Claude Code [statusline](https://docs.claude.com/en/docs/claude-code/statusline)
   script, and the source of the `cost` / `context` columns and the usage-limit readout. Claude Code pipes
   a JSON blob into it on every render — a **shell hook, not a model call, so it costs zero tokens** — and
-  it mirrors three things out of that blob to `/tmp`: context % and spend (keyed by both session id and
-  `$CMUX_SURFACE_ID`, since snapshots carry the surface and not the session), and the account-wide 5-hour
-  usage limit. Copy it to `~/.claude/statusline.sh` and point `settings.json` at it. Skip it and the
-  dashboard still works — those cells just render `-`.
+  it mirrors context % and spend to `/tmp` (keyed by both session id and `$CMUX_SURFACE_ID`), and the
+  account-wide 5-hour + 7-day usage limits to **both** the durable `quota/` dir under this harness
+  **and** `/tmp` (dual-write). Copy it to `~/.claude/statusline.sh` and point `settings.json` at it.
+  Skip it and the dashboard still works — those cells just render `-`.
 
-Runtime state lives in `$HOME` (`~/.claude/agent-dashboard/state/`), **never in a repo** — the code
-is versioned, the per-run snapshots are ephemeral and machine-local.
+**Shared harness home (all projects, including Emberfall):**
+
+```text
+~/Projects/claude-workbench/agent-dashboard/
+  state/     # live seat rows (gitignored)
+  quota/     # durable claude/codex/grok % (gitignored) — survives reboot
+  coord/     # coordinator cadence files (gitignored)
+  *.py *.sh  # versioned code
+```
+
+Optional: `ln -sfn ~/Projects/claude-workbench/agent-dashboard ~/.claude/agent-dashboard` so anything
+still hard-coded to `~/.claude/agent-dashboard` follows along. Runtime dirs are gitignored — the code
+is versioned, live snapshots and quota are machine-local under Projects.
 
 One optional third part:
 
@@ -60,9 +71,17 @@ python3 overseer.py      # optional, spare pane (run from your repo): flips rows
 
 Ctrl-C to quit (it restores your terminal on exit). The dashboard shows:
 
-- **title** — counts, total spend, and the account's **5-hour usage limit** with its reset countdown
+- **title** — counts, total spend, and Claude's **5-hour usage limit** with its reset countdown
   (`5h ████████░░ 81% used · resets 25m`) — the limit that actually stops work, so it reddens at 90%.
   Needs `statusline.sh` installed; absent, the title reads as it always did.
+- **weekly line** (directly under the title) — **7-day** plan-usage bars for **claude · codex · grok**
+  (`claude 7d ██░░░░░░░░ 18% · 4d12h   codex 7d █░░░░░░░░░ 10% · 6d22h   grok 7d —`). Claude comes
+  from `statusline.sh` (`rate_limits.seven_day` → dual-write `quota/claude-7d.txt` +
+  `/tmp/claude-rate-limit-7d.txt`). Codex is refreshed by the dashboard from ChatGPT `wham/usage`
+  (primary window ≈ weekly; falls back to the newest Codex rollout's `rate_limits.primary`) and
+  dual-writes `quota/codex-7d.txt`. Grok has no stable public weekly % API yet — leave a mirror at
+  `quota/grok-7d.txt` or `/tmp/grok-rate-limit-7d.txt` (`pct reset_epoch`) if you have one, else `—`.
+  After reboot, durable `quota/*` still paints until a live session re-mirrors.
 - **runs** — every run (role · issue · state · model · context · cost · age · pane · note): `model` shows
   which Claude model drives the run (opus/sonnet/haiku, color-coded), `context` its context-window fill as
   a mini bar (red near auto-compact; drops to a bare percent on a narrow pane rather than starving `note`),
@@ -77,8 +96,9 @@ Ctrl-C to quit (it restores your terminal on exit). The dashboard shows:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `AGENT_DASHBOARD_STATE_DIR` | `~/.claude/agent-dashboard/state` | where snapshots are written/read (emitter + dashboard must agree) |
-| `AGENT_DASHBOARD_HOME` | unset | if set, commands resolve `emit-status.sh` from here (else they look on `PATH`) |
+| `AGENT_DASHBOARD_HOME` | `~/Projects/claude-workbench/agent-dashboard` | shared harness root (state + quota + code) |
+| `AGENT_DASHBOARD_STATE_DIR` | `$AGENT_DASHBOARD_HOME/state` | where snapshots are written/read (emitter + dashboard must agree) |
+| `AGENT_DASHBOARD_QUOTA_DIR` | `$AGENT_DASHBOARD_HOME/quota` | durable claude/codex/grok % mirrors (+ `snapshot.json`) |
 | `AGENT_DASHBOARD_MODEL` | unset | overrides the model shown for a run when `--model` isn't passed (else auto-detected from cmux's launch argv) |
 | `AGENT_DASHBOARD_REFRESH` | `2` | dashboard refresh seconds |
 | `AGENT_DASHBOARD_STALE_SECS` | `900` | a non-terminal run with no update past this is flagged stale |
@@ -105,6 +125,32 @@ them to find the emitter from inside *your* project (a different repo than this 
 | `/ship` | planner → worker → reviewer → finisher (one `<issue>-pipeline` journey row) | started → waiting (each gate) → implementing → reviewing → pr-open → done |
 
 A teammate who hasn't set up the dashboard sees zero change — the emit calls no-op.
+
+### Ad-hoc lanes (sessions no skill launched)
+
+A row is just a snapshot file, so a plain chat session can claim one too — useful when you're driving
+a project by hand in a cmux tab and want it on the board next to the skill-driven runs.
+`emberfall-lane.sh` does this as a Claude Code hook (zero tokens — a shell hook, not a model call).
+Symlink it into `~/.claude/hooks/` and wire it on three events in `settings.json`:
+
+| Event | Effect |
+|---|---|
+| `UserPromptSubmit` | claims the lane (cwd in the project tree, or the prompt names it — then sticky for the session), state `implementing`; refreshes the timestamp each turn so it never goes stale |
+| `Stop` | state `started` — idle, your turn |
+| `SessionEnd` | removes the row |
+
+Rows land as `ember-chat-<sid>`, role `other`, ticket `adhoc`. The note comes from the session's
+statusline topic file, so it says what the session is actually about. `worktree_path` is set **only**
+when the session is cwd'd inside the project tree — that's the signal a coordinator uses to tell a
+lane that might be editing files apart from a chat that merely talks about the project.
+
+It will not double-claim a session a wired skill already owns (detected two ways: the prompt opens
+with an emitting slash-command, or another non-terminal row shares its `$CMUX_SURFACE_ID`) — that
+would double-count the run and plant a phantom "live editor" at a coordinator's liveness gate.
+
+Cleanup: `emberfall-lane.sh --gc` drops lanes whose cmux tab is gone (a hard-killed tab never fires
+`SessionEnd`); it no-ops entirely when cmux can't be queried, so it can never mass-delete live rows.
+`--prune` drops every ad-hoc lane — the deliberate-reset button. Neither ever touches a skill row.
 
 ## Test
 
