@@ -61,9 +61,10 @@ QUOTA_DIR = Path(os.environ.get("AGENT_DASHBOARD_QUOTA_DIR",
 PILOT_DIR = Path(os.environ["PILOT_LIGHT_DIR"]).expanduser() if os.environ.get("PILOT_LIGHT_DIR") else None
 REFRESH_SECS = float(os.environ.get("AGENT_DASHBOARD_REFRESH", "2"))
 STALE_SECS = int(os.environ.get("AGENT_DASHBOARD_STALE_SECS", str(15 * 60)))
-# Wider cap than upstream's 140: this board carries two extra columns (ctx + cost), so
-# a narrower cap would squeeze `note` to nothing on a wide terminal.
-MAX_WIDTH = int(os.environ.get("AGENT_DASHBOARD_MAX_WIDTH", "220"))
+# Neutral default (matches upstream). This board benefits from more width — it carries two
+# extra columns (ctx + cost) — so widen it per-machine with AGENT_DASHBOARD_MAX_WIDTH
+# rather than baking a wide default into the shared repo.
+MAX_WIDTH = int(os.environ.get("AGENT_DASHBOARD_MAX_WIDTH", "140"))
 MAX_ROWS = int(os.environ.get("AGENT_DASHBOARD_MAX_ROWS", "30"))
 # Private tmux socket dispatch spawns lanes on; overridable for tests / parallel setups.
 TMUX_SOCKET = os.environ.get("AGENT_DASHBOARD_TMUX_SOCKET", "agent-lanes")
