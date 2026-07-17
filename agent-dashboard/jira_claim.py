@@ -42,6 +42,7 @@ Exit codes:
     8  claim-uncertain - the assignee write committed but a later step failed; the
        issue MAY be mutated and MUST be rolled back (the caller drives that)
 """
+from __future__ import annotations
 
 import argparse
 import base64

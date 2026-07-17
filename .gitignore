@@ -3,3 +3,8 @@
 *.swo
 __pycache__/
 *.pyc
+
+# Agent dashboard runtime (shared harness under Projects — never commit live data)
+agent-dashboard/state/
+agent-dashboard/quota/
+agent-dashboard/coord/

@@ -30,7 +30,7 @@ snaps = [
     {"session": "s-mrg", "role": "finisher", "state": "merged", "ticket": "PROJ-1", "epoch": now, "note": "n"},
 ]
 d.COLOR = False
-frame = d.render_frame(snaps, set(), set(), now, 120)
+frame = d.render_frame(snaps, set(), set(), {}, {}, now, 120)
 check("🎻 implementing" in frame, "state column shows glyph-prefixed state")
 # every panel body row (starts with │) is padded to the SAME display width — emoji counted as 2
 body = [ln for ln in d._ANSI.sub("", frame).splitlines() if ln.startswith("│")]
@@ -39,12 +39,12 @@ check(len(widths) == 1, f"emoji rows column-aligned (widths={sorted(widths)})")
 
 # 2. cursor: selected row gets the ▸ marker; reverse-video only when color is on
 d.COLOR = False
-frame = d.render_frame(snaps, set(), set(), now, 120, sel_session="s-esc")
+frame = d.render_frame(snaps, set(), set(), {}, {}, now, 120, sel_session="s-esc")
 sel_line = [ln for ln in frame.splitlines() if "s-esc" in ln][0]
 check("▸ " in sel_line, "selected row shows ▸ marker (NO_COLOR)")
 check("\x1b[7m" not in sel_line, "no reverse-video under NO_COLOR")
 d.COLOR = True
-frame = d.render_frame(snaps, set(), set(), now, 120, sel_session="s-esc")
+frame = d.render_frame(snaps, set(), set(), {}, {}, now, 120, sel_session="s-esc")
 sel_line = [ln for ln in frame.splitlines() if "s-esc" in ln][0]
 check("\x1b[7m" in sel_line, "selected row is a reverse-video bar when color on")
 other = [ln for ln in frame.splitlines() if "s-imp" in ln][0]
@@ -107,7 +107,7 @@ check(len(d.order_rows(_old, now)) == 1, "day-old terminal row persists (no auto
 # gutter + glyph-widened state column push the fixed geometry past a narrow inner width;
 # every rendered body row must still clip to exactly the panel width, never spill it.
 d.COLOR = True
-frame80 = d.render_frame(snaps, set(), set(), now, 80)
+frame80 = d.render_frame(snaps, set(), set(), {}, {}, now, 80)
 body80 = [ln for ln in d._ANSI.sub("", frame80).splitlines() if ln.startswith("│")]
 w80 = {d.vlen(ln) for ln in body80}
 check(w80 == {80}, f"80-col rows clip to the border, none spill (widths={sorted(w80)})")
@@ -131,6 +131,35 @@ except Exception as e:
     check(False, f"dispatch_action raised on a non-string field: {e!r}")
 finally:
     _os.unlink(_sh.name)
+
+# 9. accurate-cost path: best-effort, never fatal, and overlays the mirror where resolvable.
+import time as _time
+d._accurate_cost_cache.clear(); d._accurate_cost_checked_at = 0.0
+check(d.read_accurate_costs([], _time.time()) == {}, "no snaps -> no accurate costs")
+d._accurate_cost_cache.clear(); d._accurate_cost_checked_at = 0.0
+# a row with no cmux_surface can't be bridged to a session -> skipped, no crash
+check(d.read_accurate_costs([{"session": "s", "state": "implementing"}], _time.time()) == {},
+      "unbridgeable row -> skipped")
+# a bogus UUID has no transcript under ~/.claude/projects -> None (caller keeps the mirror)
+check(d._cost_for_session("00000000-0000-0000-0000-000000000000") is None,
+      "unknown session uuid -> None (mirror fallback)")
+# throttle: a warm cache paints between refreshes without re-shelling
+d._accurate_cost_cache.clear(); d._accurate_cost_cache["ABC"] = 42.0
+d._accurate_cost_checked_at = _time.time()
+check(d.read_accurate_costs([], _time.time()) == {"ABC": 42.0}, "warm cache paints under throttle")
+# throttle-bypass fix: an EMPTY-but-fresh cache (a window that resolved nothing) must STILL
+# short-circuit — gating on emptiness re-shelled the glob+subprocess every frame. Detect by
+# counting _surface_to_sessionid calls: a short-circuit never reaches it.
+d._accurate_cost_cache.clear()
+d._accurate_cost_checked_at = _time.time()
+_orig_s2s = d._surface_to_sessionid
+_s2s_calls = {"n": 0}
+d._surface_to_sessionid = lambda: (_s2s_calls.__setitem__("n", _s2s_calls["n"] + 1) or {})
+try:
+    _r = d.read_accurate_costs([{"session": "s", "state": "implementing", "cmux_surface": "X"}], _time.time())
+    check(_r == {} and _s2s_calls["n"] == 0, "empty+fresh cache short-circuits, no re-shell (throttle-bypass fix)")
+finally:
+    d._surface_to_sessionid = _orig_s2s
 
 sys.exit(0 if ok else 1)
 PY

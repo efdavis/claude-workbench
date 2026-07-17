@@ -6,8 +6,10 @@
 # exit 0. Observability must never break the run it observes.
 # JSON is built with python3 (stdlib) - no jq or other dependency.
 #
-# Snapshots land in ${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}/<session>.json,
+# Snapshots land in
+#   ${AGENT_DASHBOARD_STATE_DIR:-${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}/state}/<session>.json
 # written atomically (mktemp + mv). Schema: status.schema.json (sibling).
+# Shared harness under ~/Projects so every project (Emberfall, etc.) sees one board.
 #
 # Usage:
 #   emit-status.sh --session <id> --role <role> --state <state> \
@@ -40,7 +42,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-state_dir="${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}"
+_ad_home="${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}"
+state_dir="${AGENT_DASHBOARD_STATE_DIR:-$_ad_home/state}"
 mkdir -p "$state_dir" 2>/dev/null || { warn "cannot create state dir: $state_dir"; exit 0; }
 
 # sanitize session into a safe filename stem

@@ -12,7 +12,7 @@ command (documented below), not by a tracked file.
 |------|----------------|--------------|
 | `ghostty-config` | `~/.config/ghostty/config` | Font size, foreground brightening. cmux reads this for terminal appearance. |
 | `cmux.json` | `~/.config/cmux/cmux.json` | Dark chrome (force dark mode), navy sidebar tint. |
-| `statusline.sh` | `~/.claude/statusline.sh` | Claude Code statusline: ticket/task · model·effort · context % · cost. Also needs a one-line `statusLine` entry in `~/.claude/settings.json` (see [Statusline](#statusline)). |
+| `../agent-dashboard/statusline.sh` | `~/.claude/statusline.sh` | Claude Code statusline: ticket/task · model·effort · context % · cost. Lives with its consumer (it is the dashboard's data-contract producer); symlinked in from here. Also needs a one-line `statusLine` entry in `~/.claude/settings.json` (see [Statusline](#statusline)). |
 | `cost.py` | none (run in place) | Token-dollar accounting for a Claude Code session or project, read from local transcripts. Breaks out subagent / Workflow-agent spend (see [Cost accounting](#cost-accounting)). |
 
 The theme (`TokyoNight Storm`) is stored separately in
@@ -35,7 +35,7 @@ ln -sf ~/Projects/claude-workbench/cmux/ghostty-config ~/.config/ghostty/config
 ln -sf ~/Projects/claude-workbench/cmux/cmux.json ~/.config/cmux/cmux.json
 
 # Statusline: symlink the script, then point Claude Code at it (see Statusline below)
-ln -sf ~/Projects/claude-workbench/cmux/statusline.sh ~/.claude/statusline.sh
+ln -sf ~/Projects/claude-workbench/agent-dashboard/statusline.sh ~/.claude/statusline.sh
 
 # Set the theme (writes both light and dark slots — see gotcha below)
 cmux themes set "TokyoNight Storm"

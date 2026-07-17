@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/efdavis/claude-workbench/agent-dashboard/status.schema.json",
   "title": "Agent run status snapshot",
-  "description": "Status drop for one agent run (one cmux/tmux session driving a command over one issue). Written atomically (mktemp + mv) by emit-status.sh at each phase boundary; read by dashboard.py. Runtime-only: these live in ${AGENT_DASHBOARD_STATE_DIR:-$HOME/.claude/agent-dashboard/state}/, never in a repo.",
+  "description": "Status drop for one agent run (one cmux/tmux session driving a command over one issue). Written atomically (mktemp + mv) by emit-status.sh at each phase boundary; read by dashboard.py. Runtime-only: these live in ${AGENT_DASHBOARD_STATE_DIR:-${AGENT_DASHBOARD_HOME:-$HOME/Projects/claude-workbench/agent-dashboard}/state}/, never committed (gitignored under agent-dashboard/state).",
   "type": "object",
   "additionalProperties": false,
   "required": ["session", "role", "state", "iso_timestamp", "epoch"],
@@ -45,7 +45,7 @@
     },
     "model": {
       "type": "string",
-      "description": "Which Claude model drives this run (e.g. opus, sonnet, haiku, or a full id). Set via --model, else auto-detected from $AGENT_DASHBOARD_MODEL or cmux's launch argv."
+      "description": "Which model drives this run (e.g. opus, sonnet, haiku, a full id, or a non-Claude agent such as grok or codex). Set via --model, else auto-detected from $AGENT_DASHBOARD_MODEL or cmux's launch argv — auto-detect only understands Claude/cmux launches, so non-Claude agents must pass --model explicitly."
     },
     "cmux_surface": {
       "type": "string",
