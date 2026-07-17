@@ -4,7 +4,7 @@ A live terminal view of, and index into, your agent runs. Leave it open in one p
 
 Music-themed: the dashboard is the **orchestra**, each run is a **soloist**, and the `dispatch` lane spawner is the **cue**. Naming only; the mechanics are the same filesystem-snapshot convention.
 
-It **observes and navigates**, it never mutates a run or holds a key. Every side effect (opening a cmux tab, attaching a tmux lane) is shelled out to `handler.sh`; the renderer itself stays dumb. No daemon, no cron, no persistent agents.
+It **observes and navigates**, it never mutates a live run. Every external side effect (opening a cmux tab, attaching a tmux lane) is shelled out to `handler.sh`; the renderer's only local write is the `r` key removing a finished/dead row's card. No daemon, no cron, no persistent agents.
 
 ## Keys
 
@@ -14,6 +14,7 @@ It **observes and navigates**, it never mutates a run or holds a key. Every side
 | `Enter` | open the focused run, three outcomes by liveness: a **live/ghost** row backed by a real dispatch lane opens a cmux tab that attaches it (close the tab to detach, the lane lives on); a row live only in its own cmux surface (a hands-on run, no lane) jumps straight to that cmux tab (focuses the surface, follows its workspace so the left-column selection tracks, then flashes it); anything else (finished, stale, or not yet matched) opens its newest transcript, **rendered as readable turns** (user/assistant text, tool calls, results, not the raw JSON), in a pager tab, if one exists |
 | `p` | open the run's PR in a cmux browser tab (set `AGENT_DASHBOARD_PR_URL_BASE`) |
 | `t` | open the run's issue in a cmux browser tab (set `AGENT_DASHBOARD_ISSUE_URL_BASE`) |
+| `r` | reap the focused row - remove a **merged/done or stale (💀)** card from the board. Refuses on a live/ghost row (won't yank a card from under a running agent). Deletes only the on-disk snapshot, never the run. |
 | `q` / `Ctrl-C` | quit (restores the terminal, even on SIGTERM/SIGHUP) |
 
 Actions require **cmux** (`brew install cmux`); without it the action prints an install hint and no-ops. An unhandled key shows a transient status line, never a silent no-op.
@@ -39,18 +40,19 @@ Runtime state lives in `$HOME` (`~/.claude/agent-dashboard/state/`), **never in 
 
 One optional part:
 
-- **`overseer.py`** - reconciles rows against GitHub reality. A row with a `pr_number` can outlive its emitting session (the run ends, the PR lives on, the row shows `pr-open` forever); the overseer polls GitHub and flips rows whose PR **merged** (-> `merged`) or **closed unmerged** (-> `done`), writing through `emit-status.sh` so there is still a single state writer. Open PRs are left alone, babysit owns their live status. **No LLM, zero tokens:** one `gh pr view` call per reconcilable row per tick (default 60s; `--once` for a single pass). Run it from inside the repo whose PRs you want reconciled.
+- **`overseer.py`** - reconciles rows against GitHub reality. A row with a `pr_number` can outlive its emitting session (the run ends, the PR lives on, the row shows `pr-open` forever); the overseer polls GitHub and flips rows whose PR **merged** (-> `merged`) or **closed unmerged** (-> `done`), writing through `emit-status.sh` so there is still a single state writer. Open PRs are left alone, babysit owns their live status. **No LLM, zero tokens:** one `gh pr view` call per reconcilable row per tick (default 60s; `--once` for a single pass). It only UPDATES status; it never deletes. `dash` runs it alongside the board for you (see Run), so you never invoke it directly and it dies with the board; run it standalone only if you want the reconciler without the board. To clear a dead/merged card off the board, hit `r` (removes the snapshot, not the run).
 
 ## Run
 
 ```bash
-./run.sh                 # or: python3 dashboard.py
-python3 overseer.py      # optional, spare pane (run from your repo): flips rows whose PR merged/closed
+./dash.sh                # the one you want: board + live PR status (board + overseer in one pane)
+./run.sh                 # board only, no PR-status updates (or: python3 dashboard.py)
+python3 overseer.py      # the reconciler on its own — you normally never run this; dash bundles it
 ```
 
 `q` or Ctrl-C to quit (it restores your terminal on exit). The dashboard shows:
 
-- **soloists** - every run (role · issue · state · model · age · pane · note): the `state` cell is glyph-prefixed (🎬 started · 🎻 implementing · 👀 reviewing · 🙋 waiting · 📬 pr-open · 🚨 escalated · 👏 merged · ✅ done · 💀 stale); the `model` column shows which Claude model drives the run (opus/sonnet/haiku, color-coded); the `pane` column is `live`/`ghost`/`stale`/`-`. Escalated first, then `waiting` (paused at a human gate, bold yellow), active, and terminal (merged/done) dimmed then aged out after 10m. Stale runs flagged (no update in 15m); rows capped at `AGENT_DASHBOARD_MAX_ROWS` with an overflow count. The `▸` cursor marks the focused row (reverse-video bar when color is on); `j`/`k`/arrows move it, and it tracks a run by session id so it holds position across a refresh.
+- **soloists** - every run (role · issue · state · model · age · pane · note): the `state` cell is glyph-prefixed (🎬 started · 🎻 implementing · 👀 reviewing · 🙋 waiting · 📬 pr-open · 🚨 escalated · 👏 merged · ✅ done · 💀 stale); the `model` column shows which Claude model drives the run (opus/sonnet/haiku, color-coded); the `pane` column is `live`/`ghost`/`stale`/`-`. Escalated first, then `waiting` (paused at a human gate, bold yellow), active, and terminal (merged/done) dimmed and kept until you clear them with `r`. Stale runs flagged (no update in 15m); rows capped at `AGENT_DASHBOARD_MAX_ROWS` with an overflow count. The `▸` cursor marks the focused row (reverse-video bar when color is on); `j`/`k`/arrows move it, and it tracks a run by session id so it holds position across a refresh.
 - **escalations** (red panel) - any run in `escalated` state (a hard stop, a failure). Routine gate-waits show as `waiting`, not here, red is earned.
 - footer - load average, the key legend, the state dir, refresh interval.
 
@@ -62,7 +64,6 @@ python3 overseer.py      # optional, spare pane (run from your repo): flips rows
 | `AGENT_DASHBOARD_MODEL` | unset | overrides the model shown for a run when `--model` isn't passed (else auto-detected from cmux's launch argv) |
 | `AGENT_DASHBOARD_REFRESH` | `2` | dashboard refresh seconds |
 | `AGENT_DASHBOARD_STALE_SECS` | `900` | a non-terminal run with no update past this is flagged stale |
-| `AGENT_DASHBOARD_AGEOUT_SECS` | `600` | merged/done runs drop from view after this |
 | `AGENT_DASHBOARD_MAX_ROWS` | `30` | max table rows rendered; overflow shown as a "+N more" line |
 | `AGENT_DASHBOARD_TMUX_SOCKET` | `agent-lanes` | the private `tmux -L <socket>` lane liveness reads **and the socket `handler.sh` attaches on** (the socket `dispatch` spawns on) |
 | `AGENT_DASHBOARD_PR_URL_BASE` | unset | `p` opens `<base>/<pr>` (e.g. `https://github.com/OWNER/REPO/pull`); unset -> the key prints a hint |
@@ -112,7 +113,7 @@ Pre-commit contract tests, pure stdlib (plus `jq` for the emit assertions only):
 ```bash
 ./emit-status.test.sh    # the emitter's atomic-write + best-effort contract
 ./handler.test.sh        # each action key -> recipe, and every fail-visible path (PATH-shims cmux/tmux)
-./dashboard.test.sh      # emoji alignment, the row cursor, and exact-match lane liveness
+./dashboard.test.sh      # emoji alignment, the row cursor, exact-match lane liveness, r-reap guard
 ./transcript.test.sh     # replay renderer keeps user/assistant turns, drops metadata noise
 ./dispatch.test.sh       # claim -> worktree -> lane, with fail-closed rollback (shims git/tmux/claim)
 ./check-generic.sh       # asserts no project-specific branding leaked in
