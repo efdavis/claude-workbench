@@ -17,8 +17,8 @@ on the private `tmux -L <socket>` socket (AGENT_DASHBOARD_TMUX_SOCKET).
 
 Pure stdlib on purpose — no pip install. Box-drawing panels + ANSI; honors NO_COLOR.
 
-Keys:  j/k or ↑/↓ move · Enter open (attach a live lane / replay a finished one) ·
-       p open PR · t open issue · q or Ctrl-C quit
+Keys:  j/k or ↑/↓ move · Enter open (jump to a cmux run's tab / attach a live lane /
+       replay a finished one) · p open PR · t open issue · q or Ctrl-C quit
 Run:   python3 dashboard.py
 """
 from __future__ import annotations
@@ -403,7 +403,8 @@ def dispatch_action(key: str, snap: dict | None, cmux: set[str], lanes: set[str]
     def _s(v) -> str:
         return v if isinstance(v, str) else ("" if v is None else str(v))
     argv = ["bash", HANDLER, "runs", key, _s(snap.get("ticket")), _s(snap.get("state")),
-            pane, _s(snap.get("pr_number")), _s(snap.get("worktree_path"))]
+            pane, _s(snap.get("pr_number")), _s(snap.get("worktree_path")),
+            _s(snap.get("cmux_surface"))]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=8)
         out = (r.stdout or "").strip() or (r.stderr or "").strip()
