@@ -44,6 +44,33 @@ Note the overall status: `success`/`failed`/`running`/`pending`/`canceled`.
 
 ---
 
+## Step 2.5: Merge-readiness (behind-base drift)
+
+A green pipeline and zero bot comments do NOT make a PR mergeable. If the base has moved and the repo requires branches to be up to date before merging, the PR is blocked until its branch is updated. Check the fine-grained state:
+
+```bash
+gh pr view <number> --json mergeStateStatus,mergeable,autoMergeRequest
+```
+
+**Read `mergeStateStatus`, not `mergeable`** — `mergeable` only reports conflicts (`MERGEABLE`/`CONFLICTING`), so it still says `MERGEABLE` when the branch is behind a protected base. `mergeStateStatus` carries the real reason:
+- `BEHIND` — the branch is behind the base and "Require branches to be up to date before merging" is on. Needs an update before it can merge. Do NOT dismiss "only one commit behind" — a protected base blocks on it.
+- `DIRTY` — merge conflicts with the base.
+- `BLOCKED` — a required review/check/gate is unmet (not a branch-update problem; leave it, that's a human/CI gate).
+- `UNSTABLE` — a non-required check is failing/pending.
+- `CLEAN` — mergeable.
+
+If `BEHIND` (no conflicts): update the branch with GitHub's server-side merge of the base — no local git, no force-push:
+```bash
+gh api --method PUT "repos/<owner>/<repo>/pulls/<number>/update-branch"
+```
+Wait for the new head, then re-check CI (the update retriggers it).
+
+If `DIRTY` (conflicts): rebase locally in a **dedicated worktree** (`git worktree add <scratch-path> -B <branch> origin/<branch>`), never the main worktree — a shared HEAD races concurrent agents. Resolve docs/wording conflicts yourself; if a conflict touches code semantics or security-sensitive paths, STOP and flag for the user instead. After resolving, push with `--force-with-lease` (the one sanctioned force-push, see Safety Rules).
+
+After any update or force-push, re-check auto-merge state (`autoMergeRequest`) — a new push can silently drop it. Report if it was armed before and is no longer; do NOT re-arm it yourself (merging needs the user's say-so).
+
+---
+
 ## Step 3: Fetch bot discussions
 
 ```bash
@@ -125,12 +152,19 @@ Bot comments:
 
 ## Step 6: Decide whether to re-check or stop
 
-**Stop** (done):
-- Bot comments exist AND CI is passing → triage is complete
+**A PR that's behind its base is NOT done.** A green pipeline and zero bot comments do not make it mergeable if `mergeStateStatus == BEHIND` (protected base, out of date). Before you stop, re-run the Step 2.5 check: the base can drift again while CI runs, so if the branch is behind again, update it and re-check. Fast-moving bases can take several update rounds — keep going until it's not behind, subject to the iteration cap.
+
+**Stop** (done) — ALL of these must hold:
+- Branch is not behind the base (`mergeStateStatus != BEHIND`)
+- CI is passing
+- Bot comments are all triaged
+
+...plus the hard exits (stop even if the above don't hold, but report exactly what's left unresolved):
 - Iteration count >= 3 → max window reached
 - CI canceled/skipped → nothing to wait for
 
-**Re-check** (schedule another run in 5 min):
+**Re-check** (schedule another run in 5 min) if any of:
+- Branch is behind → update now per Step 2.5, then re-check (an update retriggers CI)
 - CI still running/pending
 - No bot comments yet
 
@@ -159,9 +193,18 @@ With `TICKET` = the issue id/slug (from the branch) and `SESSION="$TICKET-finish
 
 ---
 
+## Gotchas
+
+- **Stale bot comments after an update/rebase**: if a bot comment references a file/line that no longer exists post-update, it auto-resolves. Don't waste time investigating dead references.
+- **Stale bot verification counters**: a review bot's non-resolvable "Rechecked N issues - N still open" notes can track already-resolved false positives and repost identically on every commit. Cross-check its issue-ids against actual thread resolution before treating the count as real; if the threads are resolved it's noise — report, don't chase.
+- **`mergeStateStatus` is the merge-readiness field, not `mergeable`.** `mergeable` is coarse (`CONFLICTING`/`MERGEABLE` = conflicts only). `mergeStateStatus` carries the real reason (`BEHIND`, `BLOCKED`, `UNSTABLE`, `DIRTY`, `CLEAN`). Gate "done" on it.
+- **The PR/discussions JSON can contain raw control characters** (from the body — embedded videos, newlines). A naive `json.load(...)` throws `Invalid control character`. Parse with `json.loads(text, strict=False)`.
+
+---
+
 ## Safety Rules
 
-- Never force-push
+- Never force-push, with one exception: `--force-with-lease` of the PR branch after a conflict-resolving rebase (Step 2.5)
 - Never modify test assertions to make tests pass — fix the underlying code
 - Max 3 auto-fix commits per invocation
 - If the same comment reappears after a fix attempt, stop and flag it

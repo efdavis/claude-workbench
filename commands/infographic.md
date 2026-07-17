@@ -195,3 +195,4 @@ Before presenting the final infographic to the user, verify:
 - [ ] All charts use Chart.js (no hand-coded SVG bar charts)
 - [ ] The HTML file is a single file, loadable directly in a browser with no build step
 - [ ] Research gaps file saved alongside (if there were unresolvable verification gaps)
+- [ ] The message ends with a link to view the infographic (its served URL if deployed, else the file path)
