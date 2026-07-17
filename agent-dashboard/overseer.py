@@ -74,9 +74,14 @@ def emit(snap: dict, state: str, note: str) -> None:
         args += ["--pr", str(snap["pr_number"])]
     if snap.get("worktree_path"):
         args += ["--worktree", snap["worktree_path"]]
-    env = {k: v for k, v in os.environ.items() if k != "CMUX_SURFACE_ID"}
+    if snap.get("model"):
+        args += ["--model", snap["model"]]
+    # A reconciled row has no live pane; strip the overseer's own surface id AND the
+    # model-detect env so the re-emit can't misattribute the run's model to whatever
+    # the overseer operator's shell happens to carry.
+    _strip = {"CMUX_SURFACE_ID", "AGENT_DASHBOARD_MODEL", "CMUX_AGENT_LAUNCH_ARGV_B64"}
+    env = {k: v for k, v in os.environ.items() if k not in _strip}
     try:
-        # strip the overseer's own surface id: a reconciled row has no live pane
         subprocess.run(args, timeout=10, env=env)
     except (OSError, subprocess.SubprocessError):
         pass
