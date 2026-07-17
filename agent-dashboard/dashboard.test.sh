@@ -77,6 +77,32 @@ check(d.pane_state(old, set(), {"PROJ-9"}, now) == "ghost", "matched-but-stale l
 gone = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
 check(d.pane_state(gone, set(), set(), now) == "stale", "unmatched + past stale -> stale")
 
+# 5b. reapable (the `r` guard): terminal or stale is reapable; a live/ghost row is not,
+# so `r` can never yank a card out from under a running agent.
+check(d.reapable({"session": "t", "state": "merged", "epoch": now}, set(), set(), now) is True,
+      "terminal row is reapable")
+check(d.reapable({"session": "s", "state": "pr-open", "epoch": now - (20 * 60)}, set(), set(), now) is True,
+      "stale row is reapable")
+_live = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now}
+check(d.reapable(_live, set(), {"PROJ-9"}, now) is False, "live row is NOT reapable")
+_ghost = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
+check(d.reapable(_ghost, set(), {"PROJ-9"}, now) is False, "ghost row is NOT reapable")
+
+# 5c. reap_snapshot shells emit-status --remove and deletes the on-disk card (not the run)
+import os as _o, tempfile as _tf3, subprocess as _sp
+_sd = _tf3.mkdtemp(); _o.environ["AGENT_DASHBOARD_STATE_DIR"] = _sd
+_sp.run(["bash", d.EMIT, "--session", "reapme", "--role", "finisher", "--state", "merged"], timeout=8)
+_card = _o.path.join(_sd, "reapme.json")
+check(_o.path.exists(_card), "reap test: snapshot card created")
+_msg = d.reap_snapshot("reapme")
+check(not _o.path.exists(_card) and "reaped" in _msg, f"reap_snapshot deletes the card (msg={_msg!r})")
+check(d.reap_snapshot("") == "no row selected", "reap_snapshot with no session -> friendly no-op")
+
+# 5d. terminal rows persist — no auto-ageout; a day-old merged row still renders (cleared only by r)
+_old = [{"session": "old", "role": "finisher", "state": "merged", "ticket": "PROJ-1",
+         "epoch": now - (24 * 3600), "note": "n"}]
+check(len(d.order_rows(_old, now)) == 1, "day-old terminal row persists (no auto-ageout)")
+
 # 6. no row overruns the panel border at a narrow width (80-col default). The cursor
 # gutter + glyph-widened state column push the fixed geometry past a narrow inner width;
 # every rendered body row must still clip to exactly the panel width, never spill it.

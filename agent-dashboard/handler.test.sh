@@ -69,12 +69,20 @@ out="$("$H" runs enter 'PROJ-76;rm -rf x' implementing live "" /tmp/wt)"
   && pass "issue key sanitized (no metachar injection into the sent command)" || fail "issue sanitize (got: $out)"
 
 # 1e. a row that renders `live` via its cmux surface (a hands-on run) but has NO lane must
-#     NOT attempt a doomed `tmux attach` ("can't find session: <issue>") — it reports the
-#     situation instead.
+#     NOT attempt a doomed `tmux attach` ("can't find session: <issue>") — it JUMPS to that
+#     surface's own cmux tab instead (surface.focus + flash), using the cmux_surface 8th arg.
 reset_logs
-out="$(MOCK_NO_LANE=1 "$H" runs enter PROJ-12 waiting live "" "")"
-{ ! cmux_has "tmux -L agent-lanes attach -t PROJ-12\\n" && case "$out" in *"live in cmux"*) true ;; *) false ;; esac; } \
-  && pass "live-but-no-lane row: no doomed attach, clear message" || fail "no-lane guard (got: $out)"
+out="$(MOCK_NO_LANE=1 "$H" runs enter PROJ-12 waiting live "" "" 1E51549E-1D5C-4A64-AE65-9EEB918F46D9)"
+{ ! cmux_has "tmux -L agent-lanes attach -t PROJ-12\\n" && cmux_has "surface.focus" \
+    && case "$out" in *"jumped to PROJ-12"*) true ;; *) false ;; esac; } \
+  && pass "live-but-no-lane row: jumps to its cmux tab, no doomed attach" || fail "no-lane jump (got: $out)"
+
+# 1e-2. same branch but with NO cmux_surface recorded -> clear message, no focus, no attach.
+reset_logs
+out="$(MOCK_NO_LANE=1 "$H" runs enter PROJ-12 waiting live "" "" "")"
+{ ! cmux_has "surface.focus" && ! cmux_has "tmux -L agent-lanes attach -t PROJ-12\\n" \
+    && case "$out" in *"no cmux surface recorded"*) true ;; *) false ;; esac; } \
+  && pass "live-but-no-lane, no surface: clear message, no focus/attach" || fail "no-surface guard (got: $out)"
 
 # 1f. a failed `cmux send` must be fail-visible: the attach reports 'cmux: send failed' and
 #     NOT a false 'attach → <issue>' success (the send exit code is checked).

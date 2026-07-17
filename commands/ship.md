@@ -96,15 +96,24 @@ plan path captured in Step 2** — not the bare issue; its no-arg fallback picks
 plan, which in parallel-pane use can be a different issue's.
 
 **Pre-gate digest (render, don't re-analyze).** Before the gate ask, print a short digest so the
-plan's substance is in front of the human at decision time — both verdicts, APPROVE included:
+plan's substance is in front of the human at decision time — both verdicts, APPROVE included. This is
+gate presentation, not fresh analysis: render what the plan file + review already state, with a fixed,
+small set of licensed judgements — an `Impact` high/med/low call per file, made from the plan's
+blast-radius / risk notes (plans rarely grade files, so this judgement is expected; don't hunt for
+grading text that isn't there).
 
 ```
 Plan digest: <ISSUE> (<plan path>)
 Verdict: <APPROVE|REVISE> · Confidence: <NN%>
 Approach: <first line of the plan's Approach>
 
-| File | Change |            ← one row per Files-to-Modify entry
+| File | Change | Impact |    ← one row per Files-to-Modify entry; Impact = the licensed high/med/low judgement
 ```
+
+Confidence always renders as a percentage: use the plan's number where it gives one; where it grades
+in letters, map coarsely — H → 85%, M → 60%, L → 35% — keeping the letter visible (`85% (H)`) so the
+mapping doesn't fake precision the plan lacks. On REVISE, the reviewer's findings follow the digest
+as-is, with their own confidence scores.
 
 Then stop — this gate fires **even on APPROVE** (hands-on mode is where trust gets built):
 

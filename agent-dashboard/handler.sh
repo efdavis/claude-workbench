@@ -5,7 +5,7 @@
 # CONTRACT: fire-and-forget — always exit 0, and always print exactly one status line to
 # stdout (the dashboard surfaces the last line as a transient message).
 #
-# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path>
+# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface>
 #   <coord> : which list/pane the row lives in (currently always "runs"; kept for
 #             contract-shape parity with the dashboard→handler seam, not yet branched on).
 #   <key>   : enter | p | t
@@ -27,7 +27,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"  # so replay can find transcript.py next t
 PR_URL_BASE="${AGENT_DASHBOARD_PR_URL_BASE:-}"
 ISSUE_URL_BASE="${AGENT_DASHBOARD_ISSUE_URL_BASE:-}"
 
-coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"
+coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"; surface="${8:-}"
 : "${coord:=runs}"  # currently unused beyond shape parity; keep the positional slot
 # <state> ($4) is likewise part of the contract shape but not branched on — routing is
 # keyed off <live> ($5); the slot is kept so the argv matches the dashboard→handler seam.
@@ -101,6 +101,24 @@ open_browser() {  # <label> <url>
   fi
 }
 
+# Jump the cmux view to a hands-on run's own tab: focus its surface (the horizontal
+# tab), follow with its workspace (cmux's left-column list, parsed from the focus
+# response so the whole view lands on the tab), then flash it. Best-effort;
+# cmux-required like the other openers. surface.focus alone already brings the tab
+# forward; workspace.select makes the left-column selection follow too.
+focus_cmux_tab() {  # $1 = cmux surface uuid
+  need_cmux || return 0
+  local surf="$1" out ws
+  [ -n "$surf" ] || { say "no cmux surface recorded for ${ticket:-this run}"; return 0; }
+  out="$(cmux rpc surface.focus "{\"surface_id\":\"${surf}\"}" 2>/dev/null)" \
+    || { say "cmux: focus failed for ${ticket:-this run}"; return 0; }
+  ws="$(printf '%s\n' "$out" | grep '"workspace_id"' \
+        | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' | head -1)"
+  [ -n "$ws" ] && cmux rpc workspace.select "{\"workspace_id\":\"${ws}\"}" >/dev/null 2>&1
+  cmux trigger-flash --surface "$surf" >/dev/null 2>&1
+  say "jumped to ${ticket:-run}'s cmux tab"
+}
+
 case "$key" in
   enter)
     case "$live" in
@@ -112,7 +130,8 @@ case "$key" in
         if [ -n "$ticket" ] && tmux -L "$SOCKET" has-session -t "$ticket" 2>/dev/null; then
           attach_lane
         else
-          say "${ticket:-this run} is live in cmux, not a ${SOCKET} lane — switch to its own cmux tab"
+          # not a lane -> a hands-on run in its own cmux tab: jump to it
+          focus_cmux_tab "$surface"
         fi
         ;;
       *)          replay_recording ;;   # terminal/stale/absent -> replay the transcript

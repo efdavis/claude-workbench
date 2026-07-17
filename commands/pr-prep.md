@@ -132,11 +132,22 @@ After the user reviews the description and says to proceed:
 
 1. Show the list of changed files: `git diff --name-only` (include untracked from `git ls-files --others --exclude-standard`)
 2. **Wait for user to confirm which files to stage.** Do not auto-stage everything.
-3. Format only the approved files: `prettier --write <files>` (or the relevant formatter)
-4. Stage: `git add <files>`
-5. Commit using the **Title** from Step 4 as the commit message
+3. **Re-verify the branch right before committing.** `git branch --show-current` must still equal the branch you started on. If it changed, a parallel process moved HEAD in this shared checkout — stop and surface it; never commit on a mismatched branch.
+4. Format only the approved files: `prettier --write <files>` (or the relevant formatter)
+5. **Stage explicit paths, never `git add -A`.** A primary checkout routinely carries *unrelated* uncommitted changes that `-A` would sweep into this commit (a fresh dedicated worktree is clean, so there the two are equivalent — but never rely on that). Stage the confirmed files by path, then confirm the staged set:
+   ```bash
+   git add <approved files>   # explicit paths, NOT -A
+   git status                 # confirm: only the intended files are staged, nothing unrelated
+   ```
+6. Commit using the **Title** from Step 4 as the commit message
 
 ## Step 6: Push and Create PR
+
+If the base moved while you worked, rebase before pushing so the PR is not immediately behind:
+
+```bash
+git fetch origin && git rebase origin/$BASE
+```
 
 ```bash
 git push -u origin <branch>
