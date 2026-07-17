@@ -81,18 +81,21 @@ PY
   fi
 }
 
+# Sanitize the surface id before it becomes part of a /tmp path — same defense
+# emit-status.sh applies to session ids: a stray `/` or `..` must not escape /tmp.
+_SURF="$(printf '%s' "${CMUX_SURFACE_ID:-}" | tr -c 'A-Za-z0-9._-' '_')"
 # Context % and cost, per session — so a session can self-check its own budget.
 [ -n "$SESSION_ID" ] && echo "$PCT" > "/tmp/claude-context-pct-$SESSION_ID.txt" 2>/dev/null
 [ -n "$SESSION_ID" ] && echo "$COST_RAW" > "/tmp/claude-cost-usd-$SESSION_ID.txt" 2>/dev/null
 # The same two, keyed by cmux surface id. Dashboard snapshots record the run's
 # $CMUX_SURFACE_ID but not its Claude session id, so this is the only join it has.
-[ -n "${CMUX_SURFACE_ID:-}" ] && echo "$COST_RAW" > "/tmp/claude-cost-usd-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
-[ -n "${CMUX_SURFACE_ID:-}" ] && echo "$PCT" > "/tmp/claude-context-pct-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
+[ -n "$_SURF" ] && echo "$COST_RAW" > "/tmp/claude-cost-usd-surface-$_SURF.txt" 2>/dev/null
+[ -n "$_SURF" ] && echo "$PCT" > "/tmp/claude-context-pct-surface-$_SURF.txt" 2>/dev/null
 # Surface -> Claude session UUID bridge. The $COST_RAW above is Claude's own
 # total_cost_usd, which under-reports fan-out (it misses subagent/Workflow spend); the
 # dashboard prices this run accurately by walking its transcript with cost.py, and this
 # is the only place surface id and the session UUID are both in hand to make that join.
-[ -n "${CMUX_SURFACE_ID:-}" ] && [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "/tmp/claude-sessionid-surface-$CMUX_SURFACE_ID.txt" 2>/dev/null
+[ -n "$_SURF" ] && [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "/tmp/claude-sessionid-surface-$_SURF.txt" 2>/dev/null
 # The 5-hour plan usage limit ("Current session" in claude.ai settings) + its reset epoch.
 # Account-wide, not per-session, so every session writes the same file and they agree;
 # whichever renders last wins. Guarded: older clients omit rate_limits -> PCT is -1, skip.
@@ -105,7 +108,11 @@ PY
 TICKET=""
 DESC=""
 
-# A ticket id is any ABC-123 prefix (or one of $TICKET_KEYS if set).
+# Two intentionally different matchers, by design (carried over from the pre-merge script):
+#  - TICKET_RE matches an explicit "ABC-123 desc" you named — a session name or a
+#    Claude-written context label — where you meant that key, so any uppercase key counts.
+#  - KEY_RE is applied only to the *git branch* fallback, where $TICKET_KEYS lets you avoid
+#    false hits on branches like "WIP-2"; unset, it too matches any uppercase key.
 if [ -n "$TICKET_KEYS" ]; then
   KEY_RE="($TICKET_KEYS)-([0-9]+)"
 else

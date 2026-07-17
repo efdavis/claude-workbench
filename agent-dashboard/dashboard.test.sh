@@ -147,6 +147,19 @@ check(d._cost_for_session("00000000-0000-0000-0000-000000000000") is None,
 d._accurate_cost_cache.clear(); d._accurate_cost_cache["ABC"] = 42.0
 d._accurate_cost_checked_at = _time.time()
 check(d.read_accurate_costs([], _time.time()) == {"ABC": 42.0}, "warm cache paints under throttle")
+# throttle-bypass fix: an EMPTY-but-fresh cache (a window that resolved nothing) must STILL
+# short-circuit — gating on emptiness re-shelled the glob+subprocess every frame. Detect by
+# counting _surface_to_sessionid calls: a short-circuit never reaches it.
+d._accurate_cost_cache.clear()
+d._accurate_cost_checked_at = _time.time()
+_orig_s2s = d._surface_to_sessionid
+_s2s_calls = {"n": 0}
+d._surface_to_sessionid = lambda: (_s2s_calls.__setitem__("n", _s2s_calls["n"] + 1) or {})
+try:
+    _r = d.read_accurate_costs([{"session": "s", "state": "implementing", "cmux_surface": "X"}], _time.time())
+    check(_r == {} and _s2s_calls["n"] == 0, "empty+fresh cache short-circuits, no re-shell (throttle-bypass fix)")
+finally:
+    d._surface_to_sessionid = _orig_s2s
 
 sys.exit(0 if ok else 1)
 PY

@@ -170,8 +170,17 @@ _accurate_cost_cache: dict[str, float] = {}
 _accurate_cost_checked_at = 0.0
 
 
+# A Claude session id is a canonical UUID. The bridge value comes from a world-writable
+# /tmp file and is interpolated into a glob and a subprocess arg, so validate its shape
+# here (the single read choke point) before it can steer either — a `..`/glob-metachar
+# value must never reach _cost_for_session.
+_SESSION_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 def _surface_to_sessionid() -> dict[str, str]:
-    """UPPER(surface id) -> Claude session UUID, from the statusline bridge mirrors."""
+    """UPPER(surface id) -> Claude session UUID, from the statusline bridge mirrors.
+    Only well-formed UUIDs are kept; a malformed mirror value is skipped, never used."""
     out: dict[str, str] = {}
     for path in glob.glob(SESSIONID_SURFACE_GLOB):
         surface = os.path.basename(path)[len(_SESSIONID_SURFACE_PREFIX):-len(".txt")]
@@ -179,7 +188,7 @@ def _surface_to_sessionid() -> dict[str, str]:
             uuid = Path(path).read_text().strip()
         except OSError:
             continue
-        if uuid:
+        if uuid and _SESSION_UUID_RE.match(uuid):
             out[surface.upper()] = uuid
     return out
 
@@ -212,7 +221,12 @@ def read_accurate_costs(snaps: list[dict], now: int | float) -> dict[str, float]
     so it's not a per-2s-refresh cost); the cache paints between refreshes."""
     global _accurate_cost_checked_at
     now_f = float(now)
-    if _accurate_cost_cache and now_f - _accurate_cost_checked_at < ACCURATE_COST_REFRESH_SECS:
+    # Gate on WHEN we last checked, not on whether the cache has entries: a window where
+    # nothing resolved (cost.py erroring, transcript not yet flushed, no bridgeable row)
+    # leaves the cache empty, and gating on emptiness would re-run the glob + a subprocess
+    # per row every single frame — defeating the throttle exactly in the failure case.
+    # `_accurate_cost_checked_at` starts at 0.0 (falsy), so the first call still computes.
+    if _accurate_cost_checked_at and now_f - _accurate_cost_checked_at < ACCURATE_COST_REFRESH_SECS:
         return dict(_accurate_cost_cache)
     _accurate_cost_checked_at = now_f
     bridge = _surface_to_sessionid()
@@ -311,11 +325,6 @@ CODEX_WEEKLY_QUOTA = "codex-7d.txt"
 CODEX_WEEKLY_TMP = "/tmp/codex-rate-limit-7d.txt"
 GROK_WEEKLY_QUOTA = "grok-7d.txt"
 GROK_WEEKLY_TMP = "/tmp/grok-rate-limit-7d.txt"
-# Back-compat aliases used by weekly_quota_line / ensure_codex paths below.
-CLAUDE_WEEKLY_FILE = CLAUDE_WEEKLY_TMP
-CODEX_WEEKLY_FILE = CODEX_WEEKLY_TMP
-GROK_WEEKLY_FILE = GROK_WEEKLY_TMP
-RATE_LIMIT_FILE = RATE_LIMIT_TMP
 CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"

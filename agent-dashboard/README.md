@@ -84,6 +84,10 @@ python3 overseer.py      # the reconciler on its own — you normally never run 
 | `AGENT_DASHBOARD_TMUX_SOCKET` | `agent-lanes` | the private `tmux -L <socket>` lane liveness reads **and the socket `handler.sh` attaches on** (the socket `dispatch` spawns on) |
 | `AGENT_DASHBOARD_PR_URL_BASE` | unset | `p` opens `<base>/<pr>` (e.g. `https://github.com/OWNER/REPO/pull`); unset -> the key prints a hint |
 | `AGENT_DASHBOARD_ISSUE_URL_BASE` | unset | `t` opens `<base>/<issue>` (e.g. `https://you.atlassian.net/browse`); unset -> the key prints a hint |
+| `AGENT_DASHBOARD_COST_PY` | `../cmux/cost.py` | the transcript-walking cost tool the `cost` column prices with; absent -> the column falls back to the statusline mirror |
+| `AGENT_DASHBOARD_COST_REFRESH` | `30` | seconds between accurate-cost recomputes (cost.py walks transcripts, so not per-refresh) |
+| `AGENT_DASHBOARD_CODEX_WEEKLY_REFRESH` | `60` | seconds between Codex weekly-quota refreshes from ChatGPT `wham/usage` |
+| `PILOT_LIGHT_DIR` | unset | path to a [pilot-light](../../emberfall/pilot-light) sidecar; set -> the dashboard co-launches its loop and shows a pilot panel; unset -> view-only, no panel |
 | `AGENT_DASHBOARD_DEBUG` | unset | when set, `emit-status.sh` prints why it no-op'd (else silent) |
 | `NO_COLOR` | unset | standard, disables ANSI color |
 
