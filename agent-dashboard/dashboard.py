@@ -436,13 +436,17 @@ def _format_resets(reset: int, now: int) -> str:
 
 def format_quota_bar(label: str, pct: int, reset: int, now: int,
                      name_styles: tuple[str, ...] = ()) -> str:
-    """One compact quota cell: 'claude 7d ███░░░░░░░ 42% · 3d04h'."""
+    """One compact quota cell: 'claude 7d ███░░░░░░░ 42% used · 3d04h'.
+
+    Explicitly "used" (matching quota_cell's 5h bar) because a bare "0%" next to a mostly
+    empty bar reads as "0% left" — the opposite of what it means — right when it matters
+    most (a near-empty quota looks alarming instead of reassuring)."""
     pct = max(0, min(100, pct))
     color = _quota_color(pct)
     filled = round(pct / 100 * QUOTA_BAR_CELLS)
     bar = c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
     name = c(label, *name_styles) if name_styles else c(label, "dim")
-    return (name + " " + bar + " " + c(f"{pct}%", *color)
+    return (name + " " + bar + " " + c(f"{pct}% used", *color)
             + c(f" · {_format_resets(reset, now)}", "dim"))
 
 
@@ -899,10 +903,10 @@ _FIXED = W_RUN + W_ROLE + W_TKT + W_ST + W_MODEL + W_CTX + W_COST + W_AGE + W_PA
 _SEPS = 9  # single spaces between the 10 columns
 
 
-def order_rows(snaps: list[dict], now: int) -> list[tuple[dict, bool]]:
+def order_rows(snaps: list[dict], now: int, max_rows: int = MAX_ROWS) -> list[tuple[dict, bool]]:
     """The rows in the exact order they render (and the cursor walks): escalated, then
     waiting-at-gate, then active — each oldest-first — then terminal (dimmed, newest
-    first). Terminal rows persist until reaped with `r`; capped to MAX_ROWS. Returns
+    first). Terminal rows persist until reaped with `r`; capped to max_rows. Returns
     (snap, dim)."""
     escalated = sorted([s for s in snaps if s.get("state") == "escalated"],
                        key=lambda s: int(s.get("epoch", 0)))
@@ -916,17 +920,61 @@ def order_rows(snaps: list[dict], now: int) -> list[tuple[dict, bool]]:
                       key=lambda s: int(s.get("epoch", 0)), reverse=True)
     rendered = ([(s, False) for s in escalated + waiting + active]
                 + [(s, True) for s in terminal])
-    return rendered[:MAX_ROWS]
+    return rendered[:max_rows]
 
 
 def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
                  costs: dict[str, float], ctxs: dict[str, int], now: int,
                  term_width: int, sel_session: str | None = None,
-                 status_msg: str = "") -> str:
+                 status_msg: str = "", term_height: int | None = None,
+                 scroll: list[int] | None = None) -> str:
+    """scroll, if given, is a 1-element list used as an in/out parameter: read as this
+    frame's starting scroll offset, written back with the offset actually used (clamped
+    to keep sel_session in view) — the caller carries the same list into the next frame,
+    the same way it already threads sel_session across loop iterations."""
     width = max(64, min(term_width, MAX_WIDTH))
     inner = width - 4
     w_note = max(6, inner - GUTTER - (_FIXED + _SEPS))
     bar_cells = CTX_BAR_CELLS
+
+    # Full, uncapped order — used for the title-bar counts and the escalations panel
+    # (never truncated — that's the "need you" list), and as the scrollable window source.
+    all_rows = order_rows(snaps, now, max_rows=len(snaps))
+    escal = [s for s, d in all_rows if s.get("state") == "escalated"]
+    weekly = weekly_quota_line(now)
+    pilot_lines = pilot_panel(width, now) if PILOT_DIR is not None else None
+
+    if term_height is not None:
+        # Everything in the frame *besides* the soloists panel's data rows: title, optional
+        # weekly/status lines, the panel's own chrome (blank + borders + header row), the
+        # pilot panel, the escalations panel, and the trailing blank + footer. Getting this
+        # wrong just under- or over-fills the row budget by a line or two — not fatal — but
+        # skipping it entirely is what let the frame grow taller than the pane and scroll
+        # the title/header off the top before the user ever saw them.
+        fixed = 1 + (1 if weekly else 0) + (1 if status_msg else 0)
+        fixed += 1 + 2 + 1  # blank + panel borders + header row
+        if pilot_lines is not None:
+            fixed += 1 + len(pilot_lines)
+        if escal:
+            fixed += 1 + 2 + len(escal)
+        fixed += 1 + 1  # blank + footer
+        # Reserve 2 rows for the "N more above/below" scroll indicators — worst case both
+        # show at once. Unused reserve just leaves a little slack, which is harmless.
+        cap = max(1, min(MAX_ROWS, term_height - fixed - 2))
+    else:
+        cap = MAX_ROWS
+
+    max_offset = max(0, len(all_rows) - cap)
+    scroll_offset = scroll[0] if scroll is not None else 0
+    sel_idx = next((i for i, (s, _) in enumerate(all_rows) if s.get("session") == sel_session), None)
+    if sel_idx is not None:
+        if sel_idx < scroll_offset:
+            scroll_offset = sel_idx
+        elif sel_idx >= scroll_offset + cap:
+            scroll_offset = sel_idx - cap + 1
+    scroll_offset = max(0, min(scroll_offset, max_offset))
+    if scroll is not None:
+        scroll[0] = scroll_offset
 
     def rowcells(run, role, tkt, st, model, ctx, cost, age, pane, note):
         return " ".join([_cell(run, W_RUN), _cell(role, W_ROLE), _cell(tkt, W_TKT),
@@ -974,22 +1022,26 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
         ])
         body.append(line)
 
-    rendered = order_rows(snaps, now)
+    rendered = all_rows[scroll_offset:scroll_offset + cap]
+    above = scroll_offset
+    below = max(0, len(all_rows) - scroll_offset - len(rendered))
     if not rendered:
         body.append("  " + c("no active runs — start a command or a dispatch lane", "dim"))
-    for s, dim in rendered:
-        add(s, dim=dim, selected=(s.get("session") == sel_session))
-    overflow = max(0, len(snaps) - len(rendered))
-    if overflow:
-        body.append("  " + c(f"… +{overflow} more (raise AGENT_DASHBOARD_MAX_ROWS)", "dim"))
+    else:
+        if above:
+            body.append("  " + c(f"↑ {above} more above — j/k to scroll", "dim"))
+        for s, dim in rendered:
+            add(s, dim=dim, selected=(s.get("session") == sel_session))
+        if below:
+            height_bound = term_height is not None and cap < MAX_ROWS
+            reason = "j/k to scroll" if height_bound else "j/k to scroll, or raise AGENT_DASHBOARD_MAX_ROWS"
+            body.append("  " + c(f"↓ {below} more below — {reason}", "dim"))
 
-    active_n = sum(1 for s, d in rendered if not d and s.get("state") not in ("escalated", "waiting"))
-    waiting_n = sum(1 for s, d in rendered if s.get("state") == "waiting")
-    escal = [s for s, d in rendered if s.get("state") == "escalated"]
-    done_n = sum(1 for s, d in rendered if d)
-    # Total spend across the runs on screen. Cost is per Claude/Grok session, so a lane
-    # that has handed off to a fresh tab contributes only its current session's spend.
-    spend = sum(gauge_for(s, costs) or 0.0 for s, d in rendered)
+    # Counts/spend reflect ALL runs, not just the ones that fit on screen this frame.
+    active_n = sum(1 for s, d in all_rows if not d and s.get("state") not in ("escalated", "waiting"))
+    waiting_n = sum(1 for s, d in all_rows if s.get("state") == "waiting")
+    done_n = sum(1 for s, d in all_rows if d)
+    spend = sum(gauge_for(s, costs) or 0.0 for s, d in all_rows)
     title = ("🎼 orchestra  " + datetime.now().strftime("%H:%M:%S")
              + f"   active {active_n}"
              + (f"   waiting {waiting_n}" if waiting_n else "")
@@ -997,7 +1049,6 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
              + f"   done {done_n}"
              + (f"   spend ${spend:,.2f}" if spend else ""))
     quota = quota_cell(now)
-    weekly = weekly_quota_line(now)
 
     lines: list[str] = [c(title, "bold") + (("   " + quota) if quota else "")]
     if weekly:
@@ -1007,9 +1058,9 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
     lines.append("")
     lines += panel("soloists", body, width)
 
-    if PILOT_DIR is not None:
+    if pilot_lines is not None:
         lines.append("")
-        lines += pilot_panel(width, now)
+        lines += pilot_lines
 
     if escal:
         ebody = []
@@ -1025,31 +1076,88 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
     footer = ((f"{sysl}   " if sysl else "") + keys
               + f"   state:{STATE_DIR}   quota:{QUOTA_DIR}   refresh:{REFRESH_SECS:g}s")
     lines.append(c(footer, "dim"))
-    return "\033[H" + "".join(ln + "\033[K\n" for ln in lines) + "\033[J"
+    # No trailing "\n" after the last line: a \n after the Nth line on an N-row terminal
+    # forces an implicit scroll (cursor lands on the nonexistent row N+1), which would
+    # push row 1 off-screen even when the frame is sized to fit exactly.
+    return "\033[H" + "\n".join(ln + "\033[K" for ln in lines) + "\033[J"
+
+
+def _pilot_pidfile() -> "Path | None":
+    return (PILOT_DIR / "state" / "loop.pid") if PILOT_DIR is not None else None
+
+
+def _pilot_already_running() -> int | None:
+    """PID of a live loop.sh already owning this PILOT_DIR, if any. Guards against the
+    leak this once caused: start_new_session=True deliberately detaches the pilot from
+    the dashboard so it survives a clean exit, but that also means every dashboard
+    launch (new tab, new cmux workspace) spawned ANOTHER one with nothing to stop the
+    old ones — four accumulated in practice before this check existed. Verifies the pid
+    is both alive and still actually loop.sh (not a reused pid) before trusting it;
+    removes a stale/bogus pidfile so it doesn't wedge future launches."""
+    pidfile = _pilot_pidfile()
+    if pidfile is None or not pidfile.exists():
+        return None
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)  # liveness only — no signal actually sent
+    except ProcessLookupError:
+        pidfile.unlink(missing_ok=True)  # stale: the pid is gone
+        return None
+    except PermissionError:
+        pass  # alive, just owned elsewhere — treat as running
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=2)
+        if out.returncode != 0 or "loop.sh" not in out.stdout:
+            pidfile.unlink(missing_ok=True)  # pid recycled onto an unrelated process
+            return None
+    except (OSError, subprocess.SubprocessError):
+        pass  # can't confirm either way — trust the pidfile rather than double-spawn
+    return pid
 
 
 def start_pilot() -> "subprocess.Popen | None":
     """Co-launch pilot-light's sidecar loop, if configured. Returns the process
-    (to stop on exit) or None. Never fatal: a pilot that won't start just means
-    the dashboard renders its panel as idle, same as any other read failure."""
+    (to stop on exit) or None — either because nothing is configured, or because a
+    loop.sh from an earlier (possibly force-killed) dashboard is already running
+    (see _pilot_already_running): the panel still renders from PILOT_DIR/state either
+    way, this dashboard instance just doesn't own the lifecycle of a pilot it didn't
+    start. Never fatal: a pilot that won't start just means the dashboard renders its
+    panel as idle, same as any other read failure."""
     if PILOT_DIR is None:
         return None
     loop = PILOT_DIR / "loop.sh"
     if not loop.exists():
         return None
+    if _pilot_already_running() is not None:
+        return None
     try:
         # Own process group so our Ctrl-C doesn't SIGINT it mid-window — we stop
         # it explicitly (SIGTERM) so an in-flight run is allowed to finish first.
-        return subprocess.Popen(["bash", str(loop)], cwd=str(PILOT_DIR),
+        proc = subprocess.Popen(["bash", str(loop)], cwd=str(PILOT_DIR),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
     except OSError:
         return None
+    pidfile = _pilot_pidfile()
+    if pidfile is not None:
+        try:
+            pidfile.parent.mkdir(parents=True, exist_ok=True)
+            pidfile.write_text(str(proc.pid))
+        except OSError:
+            pass  # best-effort — a missing pidfile just re-opens the race, not fatal
+    return proc
 
 
 def stop_pilot(proc: "subprocess.Popen | None") -> None:
     """Signal the loop to stop after its current tick/window. loop.sh traps TERM
-    and finishes any in-flight run before exiting, so the quota window isn't wasted."""
+    and finishes any in-flight run before exiting, so the quota window isn't wasted.
+    No-op if this dashboard instance never started one (proc is None) — including the
+    case where _pilot_already_running found someone else's, which this instance must
+    never touch: it isn't ours to stop."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -1057,6 +1165,13 @@ def stop_pilot(proc: "subprocess.Popen | None") -> None:
         proc.wait(timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
+    pidfile = _pilot_pidfile()
+    if pidfile is not None:
+        try:
+            if int(pidfile.read_text().strip()) == proc.pid:
+                pidfile.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
 
 
 def move_sel(order: list[str], current: str | None, delta: int) -> str | None:
@@ -1136,12 +1251,13 @@ def _read_key(timeout: float):
 def _oneshot() -> int:
     """Non-tty (piped / contract test): render a single frame and exit."""
     now = int(time.time())
-    w = shutil.get_terminal_size((120, 40)).columns
+    size = shutil.get_terminal_size((120, 40))
     snaps = load_snapshots()
     costs = read_costs()
     costs.update(read_accurate_costs(snaps, now))
     sys.stdout.write(render_frame(snaps, cmux_live(), tmux_lane_live(),
-                                  costs, read_ctx(), now, w))
+                                  costs, read_ctx(), now, size.columns,
+                                  term_height=size.lines))
     return 0
 
 
@@ -1174,6 +1290,7 @@ def main() -> int:
     old_termios = None
     sel_session: str | None = None
     status_msg = ""
+    scroll = [0]  # persists across frames, same as sel_session — render_frame follows the cursor
     try:
         if interactive:
             try:
@@ -1185,16 +1302,19 @@ def main() -> int:
         sys.stdout.write("\033[?1049h\033[?25l")  # alt screen + hide cursor
         while True:
             now = int(time.time())
-            w = shutil.get_terminal_size((120, 40)).columns
+            size = shutil.get_terminal_size((120, 40))
             snaps = load_snapshots()
             cmux, lanes = cmux_live(), tmux_lane_live()
             costs, ctxs = read_costs(), read_ctx()
             costs.update(read_accurate_costs(snaps, now))  # accurate overrides mirror where resolvable
-            order = [s.get("session") for s, _ in order_rows(snaps, now)]
+            # Uncapped: MAX_ROWS/the height budget only limit what's visible per frame — the
+            # cursor (and scrolling) can still reach every session, not just the first screenful.
+            order = [s.get("session") for s, _ in order_rows(snaps, now, max_rows=len(snaps))]
             if sel_session not in order:
                 sel_session = order[0] if order else None
-            sys.stdout.write(render_frame(snaps, cmux, lanes, costs, ctxs, now, w,
-                                          sel_session, status_msg))
+            sys.stdout.write(render_frame(snaps, cmux, lanes, costs, ctxs, now, size.columns,
+                                          sel_session, status_msg, term_height=size.lines,
+                                          scroll=scroll))
             sys.stdout.flush()
 
             if not interactive:
@@ -1214,18 +1334,22 @@ def main() -> int:
             elif key in ("j", "\x1b[B"):
                 sel_session = move_sel(order, sel_session, +1)
             elif key in ("\r", "\n", "p", "t"):
-                by_id = {s.get("session"): s for s, _ in order_rows(snaps, now)}
+                by_id = {s.get("session"): s for s, _ in order_rows(snaps, now, max_rows=len(snaps))}
                 snap = by_id.get(sel_session)
                 act = "enter" if key in ("\r", "\n") else key
                 status_msg = dispatch_action(act, snap, cmux, lanes, now)
             elif key == "r":
-                by_id = {s.get("session"): s for s, _ in order_rows(snaps, now)}
+                by_id = {s.get("session"): s for s, _ in order_rows(snaps, now, max_rows=len(snaps))}
                 snap = by_id.get(sel_session)
                 if snap is None:
                     status_msg = "no row selected"
                 elif reapable(snap, cmux, lanes, now):
                     status_msg = reap_snapshot(snap.get("session", ""))
-                    sel_session = None  # row is gone; next refresh snaps the cursor to the top
+                    # Move to the row above (computed against the still-current `order`, before
+                    # the reaped row vanishes). Reaping the topmost row has no "above" to move
+                    # to — move_sel clamps in place, so the now-gone id falls through the
+                    # `sel_session not in order` check next frame and lands on the new top.
+                    sel_session = move_sel(order, sel_session, -1)
                 else:
                     status_msg = f"won't reap a live row ({snap.get('state', '?')}) — only merged/done/stale"
             else:
