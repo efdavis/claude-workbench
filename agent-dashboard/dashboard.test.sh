@@ -165,6 +165,171 @@ sys.exit(0 if ok else 1)
 PY
 then pass "unit/render checks passed"; else fail "unit/render checks"; fi
 
+# --- pilot-light lifecycle: reference-counted co-launch (start_pilot/stop_pilot) ---
+# The pilot must run iff >=1 dashboard is open: first-open spawns it (if not already
+# running), last-close stops it, in any order — and a durable launchd/manual pilot
+# (no dashboard-written loop.pid) is NEVER killed by refcount teardown. These drive
+# real loop.sh subprocesses against a throwaway PILOT_LIGHT_DIR.
+if DASH_DIR="$here" python3 - <<'PY'
+import os, sys, time, subprocess, tempfile, signal
+from pathlib import Path
+sys.path.insert(0, os.environ["DASH_DIR"])
+import dashboard as d
+
+ok = True
+def check(cond, name):
+    global ok
+    print(("  ok   " if cond else "  FAIL ") + name)
+    ok = ok and cond
+
+tmp = Path(tempfile.mkdtemp())
+d.PILOT_DIR = tmp                      # helpers read this global at call time
+loop = tmp / "loop.sh"
+# A stand-in loop.sh: named loop.sh so _pilot_already_running's ps/identity check
+# recognizes it, exits promptly on SIGTERM like the real one's TERM trap.
+loop.write_text("#!/usr/bin/env bash\ntrap 'exit 0' TERM\nwhile true; do sleep 0.2; done\n")
+loop.chmod(0o755)
+
+spawned = []  # everything we launch, killed in the finally
+def raw_loop():
+    """Start a loop.sh WITHOUT going through start_pilot (no loop.pid) — a stand-in
+    for a hand-started `bash loop.sh &` / launchd-style durable pilot."""
+    p = subprocess.Popen(["bash", str(loop)], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    spawned.append(p)
+    return p
+
+def loop_pids():
+    r = subprocess.run(["pgrep", "-f", str(loop)], capture_output=True, text=True)
+    return [int(x) for x in r.stdout.split()] if r.returncode == 0 else []
+
+def wait_gone(pid, t=6.0):
+    end = time.time() + t
+    while time.time() < end:
+        try: os.kill(pid, 0)
+        except ProcessLookupError: return True
+        time.sleep(0.05)
+    return False
+
+def reaped(p, t=6.0):
+    # Death check for a pilot we spawned in-process: os.kill(pid,0) still sees a killed
+    # child as alive until it's reaped, so poll() (which reaps) is the honest probe. In
+    # real use the adopted pilot isn't the closer's child, so init reaps it — this is a
+    # test-harness artifact of us being both spawner and closer here.
+    end = time.time() + t
+    while time.time() < end:
+        if p.poll() is not None: return True
+        time.sleep(0.05)
+    return False
+
+def reg_entries():
+    reg = tmp / "state" / "dashboards"
+    return sorted(p.name for p in reg.iterdir()) if reg.exists() else []
+
+def clean():
+    # Full reset between scenarios: kill any pilot, wipe pidfile + registry.
+    for p in loop_pids():
+        try: os.kill(p, signal.SIGKILL)
+        except OSError: pass
+    for sub in (tmp / "state" / "loop.pid",):
+        sub.unlink(missing_ok=True)
+    reg = tmp / "state" / "dashboards"
+    if reg.exists():
+        for e in reg.iterdir(): e.unlink()
+
+try:
+    me = os.getpid()
+
+    # 1. First dashboard opens: spawns exactly one pilot, registers itself as a consumer.
+    clean()
+    proc = d.start_pilot()
+    time.sleep(0.3)
+    check(proc is not None and len(loop_pids()) == 1, "first start_pilot spawns exactly one pilot")
+    check(str(me) in reg_entries(), "start_pilot registers this dashboard as a consumer")
+    check(d._pilot_already_running() == proc.pid, "loop.pid names the live loop.sh")
+
+    # 2. Second dashboard opens (re-entrant start): adopts, does NOT double-spawn.
+    proc2 = d.start_pilot()
+    time.sleep(0.2)
+    check(proc2 is None and len(loop_pids()) == 1, "second start_pilot adopts — no double-spawn")
+
+    # 3. Not the last to close: a sibling is still open -> pilot keeps running.
+    sib = subprocess.Popen(["sleep", "30"]); spawned.append(sib)   # a live 'other dashboard'
+    (tmp / "state" / "dashboards" / str(sib.pid)).touch()
+    d.stop_pilot(proc)                                             # this dashboard closes first
+    time.sleep(0.2)
+    check(len(loop_pids()) == 1, "non-last close leaves the pilot running")
+    check(str(me) not in reg_entries(), "closing unregisters this dashboard")
+    check(str(sib.pid) in reg_entries(), "the still-open sibling stays registered")
+
+    # 4. Last to close stops it — even as an ADOPTER holding no Popen (proc is None).
+    #    Emulate the sibling being the final closer: its entry is the only one left, and
+    #    the closer only has the bare pid from loop.pid to signal.
+    pilot_pid = loop_pids()[0]
+    (tmp / "state" / "dashboards" / str(sib.pid)).unlink()        # sibling unregisters itself
+    sib.terminate()                                               # (and its process exits)
+    d.stop_pilot(None)                                            # adopter, last out, no Popen
+    check(reaped(proc), "last close stops the pilot even with no owned Popen")
+    check(reg_entries() == [], "registry empty after the last dashboard closes")
+    check(not (tmp / "state" / "loop.pid").exists(), "loop.pid cleared after teardown")
+
+    # 5. Order independence: whoever is last stops it. Spawner-closes-first was covered in
+    #    (3)+(4); here the spawner is ALSO the last out -> it stops its own pilot directly.
+    clean()
+    proc = d.start_pilot(); time.sleep(0.3)
+    pilot_pid = loop_pids()[0]
+    d.stop_pilot(proc)                                            # sole consumer closes
+    check(wait_gone(pilot_pid), "sole dashboard closing stops its own pilot")
+
+    # 6. Crash resilience: a consumer force-killed without stop_pilot leaves a stale entry;
+    #    the next start_pilot prunes it rather than counting a phantom forever.
+    clean()
+    dead = subprocess.Popen(["sleep", "30"]); dead_pid = dead.pid
+    dead.kill(); dead.wait()                                      # pid now dead
+    reg = tmp / "state" / "dashboards"; reg.mkdir(parents=True, exist_ok=True)
+    (reg / str(dead_pid)).touch()
+    proc = d.start_pilot(); time.sleep(0.3)
+    check(str(dead_pid) not in reg_entries(), "start_pilot prunes a crashed sibling's stale entry")
+    # ...and that self-heal makes the correct last-close call: with only THIS dashboard
+    # really live, closing it stops the pilot (the phantom doesn't wedge it open).
+    pilot_pid = loop_pids()[0]
+    d.stop_pilot(proc)
+    check(wait_gone(pilot_pid), "pruned phantom doesn't keep the pilot alive on last close")
+
+    # 7. DURABILITY (the OQ#1 safety property): a live loop.sh with NO dashboard-written
+    #    loop.pid (a hand-started / launchd-style durable pilot) is never adopted as
+    #    kill-eligible — closing the last dashboard must leave it running.
+    clean()
+    durable = raw_loop(); time.sleep(0.3)                         # running, but no loop.pid
+    check(not (tmp / "state" / "loop.pid").exists(), "durable pilot left no loop.pid")
+    (tmp / "state" / "dashboards").mkdir(parents=True, exist_ok=True)
+    (tmp / "state" / "dashboards" / str(me)).touch()             # a dashboard opens alongside it
+    d.stop_pilot(None)                                            # ...and closes, last out
+    time.sleep(0.3)
+    check(durable.poll() is None, "last close never kills a durable pilot it didn't spawn")
+
+    # 8. Stale loop.pid from a killed pilot (single-owner case) still recovers under the
+    #    registry layer: a bogus pidfile doesn't wedge the next spawn.
+    clean()
+    (tmp / "state").mkdir(parents=True, exist_ok=True)
+    (tmp / "state" / "loop.pid").write_text("999999")            # a pid that isn't alive
+    check(d._pilot_already_running() is None, "stale loop.pid (dead pid) reads as not-running")
+    proc = d.start_pilot(); time.sleep(0.3)
+    check(len(loop_pids()) == 1, "start_pilot recovers from a stale pidfile and spawns")
+    d.stop_pilot(proc); wait_gone(loop_pids()[0] if loop_pids() else -1)
+
+finally:
+    for p in loop_pids():
+        try: os.kill(p, signal.SIGKILL)
+        except OSError: pass
+    for p in spawned:
+        try: p.kill()
+        except OSError: pass
+
+sys.exit(0 if ok else 1)
+PY
+then pass "pilot lifecycle checks passed"; else fail "pilot lifecycle checks"; fi
+
 # --- CLI one-shot render (non-tty branch) over a seeded state dir ---
 D="$(mktemp -d)/state"; export AGENT_DASHBOARD_STATE_DIR="$D"
 env -u CMUX_SURFACE_ID "$here/emit-status.sh" --session cli-imp --role worker --state implementing --ticket PROJ-23 --note hi

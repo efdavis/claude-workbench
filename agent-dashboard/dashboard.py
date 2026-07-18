@@ -1086,6 +1086,97 @@ def _pilot_pidfile() -> "Path | None":
     return (PILOT_DIR / "state" / "loop.pid") if PILOT_DIR is not None else None
 
 
+def _dashboard_registry_dir() -> "Path | None":
+    """Directory of currently-open dashboards, one empty file per instance named by
+    its own pid (e.g. dashboards/42871). Reference-counts consumers of the pilot so
+    it lives iff at least one dashboard is open: the first dashboard to open spawns it
+    (if not already running), the last to close stops it — any open/close order.
+
+    A directory-of-files (vs a single locked set file) is deliberate: each dashboard
+    only ever creates/removes ITS OWN file, so add/remove never races and needs no
+    lock; membership is just the live pids among the filenames. Scoped under PILOT_DIR
+    so two different projects' pilots (each its own PILOT_LIGHT_DIR) never cross-count.
+    Mirrors _pilot_already_running's os.kill(pid, 0) liveness idiom rather than
+    inventing a second one."""
+    return (PILOT_DIR / "state" / "dashboards") if PILOT_DIR is not None else None
+
+
+def _prune_registry() -> int:
+    """Remove registry entries whose pid is dead (a dashboard force-killed without
+    running stop_pilot leaves its file behind — this is where that gets reaped) and
+    return the count of live dashboards remaining. Best-effort: an unreadable entry is
+    left in place rather than guessed-dead, so we never under-count live consumers and
+    kill a pilot someone's still using."""
+    reg = _dashboard_registry_dir()
+    if reg is None or not reg.exists():
+        return 0
+    live = 0
+    for entry in reg.iterdir():
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue  # not a pid file — leave foreign contents untouched
+        try:
+            os.kill(pid, 0)  # liveness only
+            live += 1
+        except ProcessLookupError:
+            try:
+                entry.unlink()  # dead: reap the stale entry
+            except OSError:
+                pass
+        except PermissionError:
+            live += 1  # alive, owned elsewhere — still a live consumer
+        except OSError:
+            live += 1  # can't tell — assume live rather than kill someone's pilot
+    return live
+
+
+def _register_dashboard(pid: int) -> None:
+    """Record this dashboard as an open consumer of the pilot. Idempotent; best-effort
+    (a failure just means this instance won't hold the pilot open — the same
+    conservative direction as a missing pidfile)."""
+    reg = _dashboard_registry_dir()
+    if reg is None:
+        return
+    try:
+        reg.mkdir(parents=True, exist_ok=True)
+        (reg / str(pid)).touch()
+    except OSError:
+        pass
+
+
+def _unregister_dashboard(pid: int) -> None:
+    """Drop this dashboard's own registry entry. Best-effort."""
+    reg = _dashboard_registry_dir()
+    if reg is None:
+        return
+    try:
+        (reg / str(pid)).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _terminate_pilot_by_pid(pid: int, timeout: float = 5.0) -> None:
+    """SIGTERM a pilot we don't hold a Popen for (the last dashboard to close may be
+    one that only adopted the pilot, never spawned it) and best-effort wait for it to
+    actually exit by polling os.kill(pid, 0). loop.sh traps TERM and finishes any
+    in-flight wrapper run before quitting, so it may outlive the timeout — that's fine,
+    we don't block dashboard exit indefinitely, same 5s bound as the owned-Popen path."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return  # already gone, or not ours to signal — nothing to wait on
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return  # exited
+        except OSError:
+            return  # can't probe — stop waiting
+        time.sleep(0.05)
+
+
 def _pilot_already_running() -> int | None:
     """PID of a live loop.sh already owning this PILOT_DIR, if any. Guards against the
     leak this once caused: start_new_session=True deliberately detaches the pilot from
@@ -1122,16 +1213,25 @@ def _pilot_already_running() -> int | None:
 def start_pilot() -> "subprocess.Popen | None":
     """Co-launch pilot-light's sidecar loop, if configured. Returns the process
     (to stop on exit) or None — either because nothing is configured, or because a
-    loop.sh from an earlier (possibly force-killed) dashboard is already running
-    (see _pilot_already_running): the panel still renders from PILOT_DIR/state either
-    way, this dashboard instance just doesn't own the lifecycle of a pilot it didn't
-    start. Never fatal: a pilot that won't start just means the dashboard renders its
-    panel as idle, same as any other read failure."""
+    loop.sh is already running (see _pilot_already_running): the panel still renders
+    from PILOT_DIR/state either way, and — with the dashboard registry below — this
+    instance is now counted as a consumer keeping that pilot alive even though it
+    didn't spawn it. Never fatal: a pilot that won't start just means the dashboard
+    renders its panel as idle, same as any other read failure.
+
+    Registration is independent of spawning: we mark "this dashboard is now using the
+    pilot" whether or not this instance is the one that starts the process, so the
+    last dashboard to close (not just the one that spawned) knows to stop it."""
     if PILOT_DIR is None:
         return None
     loop = PILOT_DIR / "loop.sh"
     if not loop.exists():
         return None
+    # Prune dead siblings, then count THIS dashboard as an open consumer before
+    # deciding whether to spawn — so refcounting is correct even when we adopt an
+    # already-running pilot rather than starting one.
+    _prune_registry()
+    _register_dashboard(os.getpid())
     if _pilot_already_running() is not None:
         return None
     try:
@@ -1153,22 +1253,43 @@ def start_pilot() -> "subprocess.Popen | None":
 
 
 def stop_pilot(proc: "subprocess.Popen | None") -> None:
-    """Signal the loop to stop after its current tick/window. loop.sh traps TERM
-    and finishes any in-flight run before exiting, so the quota window isn't wasted.
-    No-op if this dashboard instance never started one (proc is None) — including the
-    case where _pilot_already_running found someone else's, which this instance must
-    never touch: it isn't ours to stop."""
-    if proc is None or proc.poll() is not None:
+    """Unregister this dashboard and, ONLY if it was the last one open, stop the pilot.
+    loop.sh traps TERM and finishes any in-flight run before exiting, so the quota
+    window isn't wasted.
+
+    The gate moved from "did *I* start it" (the old `proc is None` no-op) to "is anyone
+    else still using it": the last dashboard to close might be one that merely adopted
+    the pilot and holds no Popen, so we terminate by the pid in loop.pid, not via proc.
+    We only ever terminate a pilot whose loop.pid we can confirm is a live loop.sh —
+    and since only start_pilot() ever writes loop.pid (launchd runs wrapper.sh directly,
+    a hand-started `loop.sh` writes no pidfile), a durable launchd/manual pilot is never
+    matched here and never killed."""
+    if PILOT_DIR is None:
         return
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    _unregister_dashboard(os.getpid())
+    still_open = _prune_registry()  # also reaps any siblings that crashed without cleanup
+    if still_open > 0:
+        # Others still using the pilot — leave it running. If we own the Popen it's
+        # detached (start_new_session) and survives our exit, exactly as intended.
+        return
+
+    # We were the last dashboard open: stop the pilot it/we left running.
+    pid = _pilot_already_running()  # live loop.sh owning this PILOT_DIR, else None
+    if pid is not None:
+        if proc is not None and proc.poll() is None and proc.pid == pid:
+            try:
+                proc.terminate()      # fast path: we hold the Popen for this exact pid
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            _terminate_pilot_by_pid(pid)  # adopted pilot: signal by bare pid
     pidfile = _pilot_pidfile()
     if pidfile is not None:
         try:
-            if int(pidfile.read_text().strip()) == proc.pid:
+            # Only clear the pidfile if it still names the pilot we just stopped, so a
+            # racing start_pilot that spawned a fresh one keeps its own record.
+            if pid is not None and int(pidfile.read_text().strip()) == pid:
                 pidfile.unlink(missing_ok=True)
         except (OSError, ValueError):
             pass
