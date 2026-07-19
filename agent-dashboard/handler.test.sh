@@ -58,6 +58,15 @@ out="$("$H" runs enter '#193' implementing live "" /tmp/wt "" ember-codex-1)"
   && pass "attach: explicit Codex tmux session" || fail "explicit tmux attach (got: $out)"
 case "$out" in *"attach → ember-codex-1"*) pass "explicit tmux: status line" ;; *) fail "explicit tmux status (got: $out)" ;; esac
 
+# 1a-3. a live activity stream opens the read-only follower instead of attaching tmux.
+reset_logs
+stream="$TMP/seat one/current;safe.jsonl"; mkdir -p "$(dirname "$stream")"; : > "$stream"
+out="$("$H" runs enter '#195' implementing live "" /tmp/wt "" ember-codex-1 "" "$stream")"
+{ cmux_has "new-surface" && ! cmux_has "tmux -L agent-lanes attach -t ember-codex-1\\n" \
+    && grep -F -- "--follow" "$CMUX_LOG" >/dev/null \
+    && grep -F -- "current\\;safe.jsonl" "$CMUX_LOG" >/dev/null; } \
+  && pass "live activity stream: safe follower command, no tmux attach" || fail "live activity monitor (got: $out)"
+
 # 1b. enter on a GHOST row also attaches (the tmux session still exists)
 reset_logs
 out="$("$H" runs enter PROJ-76 implementing ghost "" /tmp/wt)"
@@ -120,6 +129,13 @@ out="$("$H" runs enter '#193' done - "" "$wt" "" "" "$cid")"
 cmux_has "python3 $here/transcript.py $croll | less -R\\n" \
   && pass "recording: exact Codex rollout by thread id" || fail "recording: exact Codex rollout"
 case "$out" in *"replay $croll"*) pass "Codex recording: status line" ;; *) fail "Codex recording status (got: $out)" ;; esac
+
+# 2c. a terminal activity stream uses the exact saved path in non-follow mode.
+reset_logs
+out="$("$H" runs enter '#195' done - "" "$wt" "" ember-codex-1 "" "$stream")"
+{ cmux_has "python3 $here/codex-stream.py $TMP/seat\\ one/current\\;safe.jsonl\\n" \
+    && ! grep -F -- "--follow" "$CMUX_LOG" >/dev/null; } \
+  && pass "terminal activity stream: exact non-follow replay" || fail "terminal stream replay (got: $out)"
 
 # 3. enter dead, no worktree recorded -> visible message, no cmux call
 reset_logs

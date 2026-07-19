@@ -11,7 +11,7 @@ It **observes and navigates**, and `r` is the one intentional kill path for a st
 | Key | Action |
 |---|---|
 | `j` / `k` or `↓` / `↑` | move the row cursor (tracks a run by session id, so it stays put across refresh/re-sort) |
-| `Enter` | open the focused run, three outcomes by liveness: a **live/ghost** row backed by a real dispatch lane opens a cmux tab that attaches it (close the tab to detach, the lane lives on); a row live only in its own cmux surface (a hands-on run, no lane) jumps straight to that cmux tab; anything else opens its exact Codex rollout when `codex_session_id` is recorded, otherwise the newest Claude transcript under its worktree, **rendered as readable turns**, in a pager tab |
+| `Enter` | open the focused run: a row with `activity_stream_path` opens a disposable, read-only activity monitor (follow mode while live; exact replay when terminal); otherwise a **live/ghost** dispatch lane attaches in a disposable cmux tab, a hands-on row jumps to its own tab, and a dead row opens its exact Codex rollout or newest Claude transcript as readable turns |
 | `p` | open the run's PR in a cmux browser tab (set `AGENT_DASHBOARD_PR_URL_BASE`) |
 | `t` | open the run's issue in a cmux browser tab (set `AGENT_DASHBOARD_ISSUE_URL_BASE`) |
 | `n` | expand the focused row's **full note** in a panel under the soloists table (the note column truncates). `j`/`k` retargets the panel to the new row; `n` again or bare `Esc` closes it. Local only — no cmux. |
@@ -32,11 +32,12 @@ No install, no setup beyond `python3`. From this directory:
 
 Four moving parts, joined by a filesystem convention:
 
-- **`emit-status.sh`** - a tiny bash helper the commands call at each phase boundary. It writes one atomic JSON snapshot per run (built with python3 stdlib, no `jq` or other dependency) to `${AGENT_DASHBOARD_STATE_DIR:-~/Projects/claude-workbench/agent-dashboard/state}/<session>.json` (schema: [`status.schema.json`](./status.schema.json)). Persistent workers can record an exact `tmux_session`; Codex rows can also record `codex_session_id` for exact replay. **Best-effort by contract:** if it's absent or the state dir is unwritable it silently no-ops, so it can never break the run it observes.
+- **`emit-status.sh`** - a tiny bash helper the commands call at each phase boundary. It writes one atomic JSON snapshot per run (built with python3 stdlib, no `jq` or other dependency) to `${AGENT_DASHBOARD_STATE_DIR:-~/Projects/claude-workbench/agent-dashboard/state}/<session>.json` (schema: [`status.schema.json`](./status.schema.json)). Persistent workers can record an exact `tmux_session`, `codex_session_id`, and generic local `activity_stream_path`. **Best-effort by contract:** if it's absent or the state dir is unwritable it silently no-ops, so it can never break the run it observes.
 - **`dashboard.py`** - polls that state dir and renders a live cross-section, plus the row cursor + action keys. Pane liveness comes from two anchored, exact-match sources per refresh: cmux rows match the emitter's captured `$CMUX_SURFACE_ID` against `cmux tree` (for hands-on runs), and dispatch lanes match against one `tmux -L <socket> list-sessions` (a row's `<issue>` / `<issue>-worker` matched to a lane named `<issue>` **exactly**, never a prefix rule, which would cross-match sibling issue numbers like `PROJ-7` vs `PROJ-76`). A live match past the stale threshold shows as `ghost`; a terminal (merged/done) row is never live. Pure stdlib Python 3; ANSI rendering; honors `NO_COLOR`.
 - **`statusline.sh`** - a Claude Code [statusline](https://docs.claude.com/en/docs/claude-code/statusline) script, and the source of the `cost` / `ctx` columns and the usage-limit readout. Claude Code pipes a JSON blob into it on every render — a **shell hook, not a model call, so it costs zero tokens** — and it mirrors context % and spend to `/tmp` (keyed by both session id and `$CMUX_SURFACE_ID`), and the account-wide 5-hour + 7-day usage limits to **both** the durable `quota/` dir under this harness **and** `/tmp` (dual-write). Copy it to `~/.claude/statusline.sh` and point `settings.json` at it. Skip it and the dashboard still works — those cells just render `-`.
 - **`handler.sh`** - the one external action handler `dashboard.py` shells out to on an action key (`handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface>`). It owns every side effect (cmux tabs, `tmux attach`/`kill-session`, close-surface on `r`, the transcript pager), keeping the renderer a pure viewer. **cmux-required for open/jump, fire-and-forget:** always exits 0 and prints one status line the dashboard surfaces.
 - **`transcript.py`** - renders a finished Claude Code session or Codex rollout `.jsonl` into readable turns (user/assistant text, tool calls with a one-line arg hint, truncated tool results, a compact thinking marker) and drops hook/mode/system metadata noise. `handler.sh`'s replay action pipes it into a pager (`transcript.py <file> | less -R`). Pure stdlib.
+- **`codex-stream.py`** - renders the already-written `codex exec --json` event stream as progress text, compact command results, and file changes. `--follow` survives partial lines and atomic stream-path rotation. It is a local file reader only: closing its cmux tab ends the renderer and never signals or attaches to the worker, tmux, Codex, OpenAI, or any remote API.
 
 **Shared harness home (all projects, including Emberfall):**
 
@@ -140,6 +141,7 @@ Pre-commit contract tests, pure stdlib (plus `jq` for the emit assertions only):
 ./handler.test.sh        # each action key -> recipe, and every fail-visible path (PATH-shims cmux/tmux)
 ./dashboard.test.sh      # emoji alignment, the row cursor, exact-match lane liveness, r-reap guard
 ./transcript.test.sh     # replay renderer keeps user/assistant turns, drops metadata noise
+./codex-stream.test.sh   # exec-stream parsing, partial writes, redaction, and rotation
 ./dispatch.test.sh       # claim -> worktree -> lane, with fail-closed rollback (shims git/tmux/claim)
 ./check-generic.sh       # asserts no project-specific branding leaked in
 ```

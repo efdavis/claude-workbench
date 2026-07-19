@@ -11,7 +11,7 @@ fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
 # --- unit + render checks (python drives the width math it must get right) ---
 if DASH_DIR="$here" python3 - <<'PY'
-import os, sys
+import os, sys, tempfile
 sys.path.insert(0, os.environ["DASH_DIR"])
 import dashboard as d
 
@@ -80,6 +80,16 @@ codex_fresh = {"session": "ember-codex-1", "tmux_session": "codex-seat-1",
                "state": "implementing", "epoch": now}
 check(d.pane_state(codex_fresh, set(), {"codex-seat-1"}, now) == "live",
       "explicit Codex tmux lane -> live")
+
+# dispatch forwards the exact generic activity stream field to the handler seam.
+_old_handler = d.HANDLER
+_capture = tempfile.NamedTemporaryFile(mode="w", delete=False)
+_capture.write('#!/usr/bin/env bash\nprintf "%s\\n" "${11}"\n')
+_capture.close(); os.chmod(_capture.name, 0o755); d.HANDLER = _capture.name
+check(d.dispatch_action("enter", {"session": "s", "state": "done", "epoch": now,
+      "activity_stream_path": "/tmp/a path/current.jsonl"}, set(), set(), now)
+      == "/tmp/a path/current.jsonl", "dispatch forwards activity_stream_path")
+d.HANDLER = _old_handler; os.unlink(_capture.name)
 old = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
 check(d.pane_state(old, set(), {"PROJ-9"}, now) == "ghost", "matched-but-stale lane -> ghost")
 gone = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}

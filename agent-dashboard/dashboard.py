@@ -1856,7 +1856,7 @@ def dispatch_action(key: str, snap: dict | None, cmux: set[str], lanes: set[str]
     argv = ["bash", HANDLER, "runs", key, _s(snap.get("ticket")), _s(snap.get("state")),
             pane, _s(snap.get("pr_number")), _s(snap.get("worktree_path")),
             _s(snap.get("cmux_surface")), _s(snap.get("tmux_session")),
-            _s(snap.get("codex_session_id"))]
+            _s(snap.get("codex_session_id")), _s(snap.get("activity_stream_path"))]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=8)
         out = (r.stdout or "").strip() or (r.stderr or "").strip()

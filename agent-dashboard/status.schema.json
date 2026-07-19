@@ -63,6 +63,10 @@
       "type": "string",
       "description": "Exact persistent tmux session name on AGENT_DASHBOARD_TMUX_SOCKET. When present, pane liveness, Enter attach, and r termination use this value rather than inferring a lane from the issue or dashboard row id."
     },
+    "activity_stream_path": {
+      "type": "string",
+      "description": "Exact local JSONL activity stream to render. Live rows follow this path across atomic symlink rotation; terminal rows replay it without contacting the agent or a model."
+    },
     "note": {
       "type": "string",
       "description": "One-line human-readable status the operator sees in the dashboard."

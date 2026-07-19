@@ -30,10 +30,11 @@ jq -e '.pr_number == "51" and .worktree_path == "/tmp/wt"' "$AGENT_DASHBOARD_STA
   && pass "optional fields present when passed" || fail "optional fields"
 
 "$E" --session s2ids --role worker --state implementing \
-  --tmux-session ember-codex-1 --codex-session-id 01234567-89ab-cdef-0123-456789abcdef
-jq -e '.tmux_session == "ember-codex-1" and .codex_session_id == "01234567-89ab-cdef-0123-456789abcdef"' \
+  --tmux-session ember-codex-1 --codex-session-id 01234567-89ab-cdef-0123-456789abcdef \
+  --activity-stream-path '/tmp/seat one/current.jsonl'
+jq -e '.tmux_session == "ember-codex-1" and .codex_session_id == "01234567-89ab-cdef-0123-456789abcdef" and .activity_stream_path == "/tmp/seat one/current.jsonl"' \
   "$AGENT_DASHBOARD_STATE_DIR/s2ids.json" >/dev/null 2>&1 \
-  && pass "tmux/Codex identity fields present" || fail "tmux/Codex identity fields"
+  && pass "tmux/Codex identity and activity stream fields present" || fail "tmux/Codex/activity fields"
 
 # 2b. cmux_surface: captured from $CMUX_SURFACE_ID, absent when unset
 CMUX_SURFACE_ID="AAAAAAAA-TEST-UUID" "$E" --session s2b --role worker --state started

@@ -5,7 +5,7 @@
 # CONTRACT: fire-and-forget — always exit 0, and always print exactly one status line to
 # stdout (the dashboard surfaces the last line as a transient message).
 #
-# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface> [tmux_session] [codex_session_id]
+# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface> [tmux_session] [codex_session_id] [activity_stream_path]
 #   <coord> : which list/pane the row lives in (currently always "runs"; kept for
 #             contract-shape parity with the dashboard→handler seam, not yet branched on).
 #   <key>   : enter | p | t | r
@@ -27,7 +27,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"  # so replay can find transcript.py next t
 PR_URL_BASE="${AGENT_DASHBOARD_PR_URL_BASE:-}"
 ISSUE_URL_BASE="${AGENT_DASHBOARD_ISSUE_URL_BASE:-}"
 
-coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"; surface="${8:-}"; tmux_session="${9:-}"; codex_session_id="${10:-}"
+coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"; surface="${8:-}"; tmux_session="${9:-}"; codex_session_id="${10:-}"; activity_stream_path="${11:-}"
 : "${coord:=runs}"  # currently unused beyond shape parity; keep the positional slot
 # <state> ($4) is likewise part of the contract shape but not branched on — routing is
 # keyed off <live> ($5); the slot is kept so the argv matches the dashboard→handler seam.
@@ -102,6 +102,18 @@ replay_recording() {
   # Render the raw .jsonl into readable turns (transcript.py) rather than paging the raw
   # JSON — the raw file is dominated by hook/metadata noise. less -R keeps the ANSI colors.
   cmux_terminal "📼 ${ticket:-run}" "python3 ${HERE}/transcript.py ${jsonl} | less -R" && say "replay ${jsonl}"
+}
+
+monitor_activity() {
+  need_cmux || return 0
+  [ -n "$activity_stream_path" ] || { say "no activity stream for ${ticket:-this row}"; return 0; }
+  local renderer_q stream_q command
+  printf -v renderer_q '%q' "$HERE/codex-stream.py"
+  printf -v stream_q '%q' "$activity_stream_path"
+  command="python3 ${renderer_q}"
+  case "$live" in live|ghost) command="${command} --follow" ;; esac
+  command="${command} ${stream_q}"
+  cmux_terminal "💬 ${ticket:-activity}" "$command" && say "monitor ${activity_stream_path}"
 }
 
 open_browser() {  # <label> <url>
@@ -208,7 +220,9 @@ end_live_run() {
 
 case "$key" in
   enter)
-    case "$live" in
+    if [ -n "$activity_stream_path" ]; then
+      monitor_activity
+    else case "$live" in
       live|ghost)
         # A row renders `live` from EITHER source: a real lane (dispatch), OR just a live
         # cmux surface (a hands-on run). Only the former is an attachable tmux session;
@@ -222,7 +236,7 @@ case "$key" in
         fi
         ;;
       *)          replay_recording ;;   # terminal/stale/absent -> replay the transcript
-    esac
+    esac; fi
     ;;
   p)
     if [ -z "$pr" ]; then
