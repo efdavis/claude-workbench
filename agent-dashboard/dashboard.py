@@ -1153,11 +1153,13 @@ def tmux_lane_live() -> set[str]:
     return set()
 
 
-def lane_live_match(session: str, lane_sessions: set[str]) -> bool:
+def lane_live_match(session: str, lane_sessions: set[str], tmux_session: str = "") -> bool:
     """Exact match only. A row session (<issue> or <issue>-worker) is live iff some
     lane session name <issue> satisfies session == <issue> or session ==
     <issue>-worker. NOT a prefix test: a live 'PROJ-7' must never light up
     'PROJ-76-worker' (reachable under the parallel lanes dispatch creates)."""
+    if tmux_session:
+        return tmux_session in lane_sessions
     if not session:
         return False
     for t in lane_sessions:
@@ -1194,7 +1196,8 @@ def pane_state(s: dict, cmux: set[str], lanes: set[str], now: int) -> str:
         return "-"
     age = now - int(s.get("epoch", 0))
     live_match = (str(s.get("cmux_surface", "")).upper() in cmux
-                  or lane_live_match(s.get("session", ""), lanes))
+                  or lane_live_match(s.get("session", ""), lanes,
+                                     str(s.get("tmux_session", ""))))
     if live_match:
         return "live" if age <= STALE_SECS else "ghost"
     return "stale" if age > STALE_SECS else "-"
@@ -1852,7 +1855,8 @@ def dispatch_action(key: str, snap: dict | None, cmux: set[str], lanes: set[str]
         return v if isinstance(v, str) else ("" if v is None else str(v))
     argv = ["bash", HANDLER, "runs", key, _s(snap.get("ticket")), _s(snap.get("state")),
             pane, _s(snap.get("pr_number")), _s(snap.get("worktree_path")),
-            _s(snap.get("cmux_surface"))]
+            _s(snap.get("cmux_surface")), _s(snap.get("tmux_session")),
+            _s(snap.get("codex_session_id"))]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=8)
         out = (r.stdout or "").strip() or (r.stderr or "").strip()

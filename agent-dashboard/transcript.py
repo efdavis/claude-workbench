@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a Claude Code session transcript (.jsonl) as readable turns, for the dashboard's
+"""Render a Claude Code or Codex session transcript (.jsonl) as readable turns, for the dashboard's
 replay action (Enter on a finished run).
 
 The raw .jsonl is one JSON object per line and is dominated by hook/attachment/mode/session
@@ -94,15 +94,33 @@ def render(path: str, out=sys.stdout) -> int:
                 d = json.loads(line)
             except ValueError:
                 continue  # skip a half-written / non-JSON line, never fatal
-            if not isinstance(d, dict) or d.get("type") not in ("user", "assistant"):
+            if not isinstance(d, dict):
+                continue
+            # Claude stores top-level user/assistant records with a `message`. Codex
+            # stores them as response_item payloads. Normalize both into the same shape,
+            # while deliberately dropping developer/system/world-state records.
+            if d.get("type") in ("user", "assistant"):
+                msg = d.get("message")
+            elif d.get("type") == "response_item":
+                payload = d.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "message" \
+                        or payload.get("role") not in ("user", "assistant"):
+                    continue
+                msg = payload
+            else:
                 continue  # drop hooks / attachments / mode / title / metadata noise
-            msg = d.get("message")
             if not isinstance(msg, dict):
                 continue
             role = (msg.get("role") or d.get("type") or "?").upper()
             ts = (d.get("timestamp") or "")[11:19]
             printed = False
-            for kind, text in _blocks(msg.get("content")):
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Codex calls its text blocks input_text/output_text; Claude uses text.
+                content = [({"type": "text", "text": b.get("text", "")}
+                            if isinstance(b, dict) and b.get("type") in ("input_text", "output_text")
+                            else b) for b in content]
+            for kind, text in _blocks(content):
                 if not (text or "").strip():
                     continue
                 if not printed:

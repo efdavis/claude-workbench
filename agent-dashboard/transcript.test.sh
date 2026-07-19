@@ -34,6 +34,18 @@ case "$out" in *"build ok"*) pass "shows tool result" ;; *) fail "tool result" ;
 case "$out" in *hook_success*|*some-noise-title*|*last-prompt*) fail "metadata noise leaked into output" ;; *) pass "drops hook/mode/title/metadata noise" ;; esac
 case "$out" in *USER*ASSISTANT*) pass "role headers present" ;; *) fail "role headers" ;; esac
 
+# Codex rollout shape: response_item/message with input_text + output_text blocks.
+cat > "$TMP/codex.jsonl" <<'EOF'
+{"timestamp":"2026-07-19T00:25:02.072Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"hidden developer instructions"}]}}
+{"timestamp":"2026-07-19T00:25:02.073Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"monitor this exact Codex seat"}]}}
+{"timestamp":"2026-07-19T00:25:09.867Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Attached to the persistent lane."}]}}
+EOF
+co="$(python3 "$T" "$TMP/codex.jsonl" | sed 's/\x1b\[[0-9;]*m//g')"
+case "$co" in *"monitor this exact Codex seat"*"Attached to the persistent lane."*) \
+  pass "renders exact Codex rollout turns" ;; *) fail "Codex rollout rendering" ;; esac
+case "$co" in *"hidden developer instructions"*) fail "Codex developer noise leaked" ;; *) \
+  pass "drops Codex developer/system noise" ;; esac
+
 # no-turns transcript -> friendly message, exit 0
 echo '{"type":"mode","mode":"normal"}' > "$TMP/empty.jsonl"
 o2="$(python3 "$T" "$TMP/empty.jsonl")"; rc=$?

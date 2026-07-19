@@ -14,7 +14,8 @@
 # Usage:
 #   emit-status.sh --session <id> --role <role> --state <state> \
 #                  [--ticket PROJ-N] [--pr <number>] [--worktree <path>] [--model <name>] \
-#                  [--claude-session-id <uuid>] [--note "..."]
+#                  [--claude-session-id <uuid>] [--codex-session-id <uuid>]
+#                  [--tmux-session <name>] [--note "..."]
 #   emit-status.sh --remove --session <id>        # prune a run's snapshot
 #
 #   role  = planner | worker | reviewer | finisher | groomer | other
@@ -27,7 +28,7 @@ set -u
 
 warn() { [ -n "${AGENT_DASHBOARD_DEBUG:-}" ] && printf 'emit-status: %s\n' "$*" >&2; return 0; }
 
-session="" role="" state="" ticket="" pr="" note="" worktree="" model="" claude_session_id="" remove=""
+session="" role="" state="" ticket="" pr="" note="" worktree="" model="" claude_session_id="" codex_session_id="" tmux_session="" remove=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --session)  session="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
@@ -39,6 +40,8 @@ while [ $# -gt 0 ]; do
     --worktree) worktree="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --model)    model="${2:-}";   shift; [ $# -gt 0 ] && shift ;;
     --claude-session-id) claude_session_id="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --codex-session-id) codex_session_id="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --tmux-session) tmux_session="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --remove)   remove=1;         shift   ;;
     *)          warn "unknown arg: $1"; shift ;;
   esac
@@ -66,10 +69,10 @@ epoch="$(date +%s 2>/dev/null)" || { warn "date failed"; exit 0; }
 iso="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || iso=""
 tmp="$(mktemp "$state_dir/.${safe_session}.XXXXXX" 2>/dev/null)" || { warn "mktemp failed"; exit 0; }
 
-python3 - "$session" "$role" "$state" "$ticket" "$pr" "$worktree" "$note" "$iso" "$epoch" "${CMUX_SURFACE_ID:-}" "$model" "$claude_session_id" \
+python3 - "$session" "$role" "$state" "$ticket" "$pr" "$worktree" "$note" "$iso" "$epoch" "${CMUX_SURFACE_ID:-}" "$model" "$claude_session_id" "$codex_session_id" "$tmux_session" \
   > "$tmp" 2>/dev/null <<'PY' || { warn "python3 write failed"; rm -f "$tmp" 2>/dev/null; exit 0; }
 import base64, json, os, sys
-session, role, state, ticket, pr, worktree, note, iso, epoch, cmux_surface, model, claude_session_id = sys.argv[1:13]
+session, role, state, ticket, pr, worktree, note, iso, epoch, cmux_surface, model, claude_session_id, codex_session_id, tmux_session = sys.argv[1:15]
 if not model:
     model = os.environ.get("AGENT_DASHBOARD_MODEL", "")
 if not model:
@@ -99,6 +102,10 @@ if cmux_surface:
     doc["cmux_surface"] = cmux_surface
 if claude_session_id:
     doc["claude_session_id"] = claude_session_id
+if codex_session_id:
+    doc["codex_session_id"] = codex_session_id
+if tmux_session:
+    doc["tmux_session"] = tmux_session
 json.dump(doc, sys.stdout)
 PY
 

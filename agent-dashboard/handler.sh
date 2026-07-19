@@ -5,7 +5,7 @@
 # CONTRACT: fire-and-forget — always exit 0, and always print exactly one status line to
 # stdout (the dashboard surfaces the last line as a transient message).
 #
-# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface>
+# Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface> [tmux_session] [codex_session_id]
 #   <coord> : which list/pane the row lives in (currently always "runs"; kept for
 #             contract-shape parity with the dashboard→handler seam, not yet branched on).
 #   <key>   : enter | p | t | r
@@ -27,7 +27,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"  # so replay can find transcript.py next t
 PR_URL_BASE="${AGENT_DASHBOARD_PR_URL_BASE:-}"
 ISSUE_URL_BASE="${AGENT_DASHBOARD_ISSUE_URL_BASE:-}"
 
-coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"; surface="${8:-}"
+coord="${1:-}"; key="${2:-}"; ticket="${3:-}"; state="${4:-}"; live="${5:-}"; pr="${6:-}"; worktree="${7:-}"; surface="${8:-}"; tmux_session="${9:-}"; codex_session_id="${10:-}"
 : "${coord:=runs}"  # currently unused beyond shape parity; keep the positional slot
 # <state> ($4) is likewise part of the contract shape but not branched on — routing is
 # keyed off <live> ($5); the slot is kept so the argv matches the dashboard→handler seam.
@@ -43,6 +43,8 @@ SOCKET="${AGENT_DASHBOARD_TMUX_SOCKET:-agent-lanes}"
 # charset filter below turns it into "_39", which breaks both tmux session lookup and the
 # GitHub issue URL built from ISSUE_URL_BASE.
 ticket="$(printf '%s' "$ticket" | sed 's/^#//' | tr -c 'A-Za-z0-9._-' '_')"
+tmux_session="$(printf '%s' "$tmux_session" | tr -c 'A-Za-z0-9._-' '_')"
+lane="${tmux_session:-$ticket}"
 
 say() { printf '%s\n' "$*"; }
 
@@ -72,15 +74,22 @@ cmux_terminal() {
 
 attach_lane() {
   need_cmux || return 0
-  [ -n "$ticket" ] || { say "no issue for this row"; return 0; }
+  [ -n "$lane" ] || { say "no tmux session for this row"; return 0; }
   # Clear any stuck tmux copy/view-mode FIRST: attaching to a session the user scrolled
   # into otherwise hangs. Harmless no-op if not in a mode.
-  tmux -L "$SOCKET" send-keys -t "$ticket" -X cancel 2>/dev/null || true
-  cmux_terminal "🎻 ${ticket}" "tmux -L ${SOCKET} attach -t ${ticket}" && say "attach → ${ticket}"
+  tmux -L "$SOCKET" send-keys -t "$lane" -X cancel 2>/dev/null || true
+  cmux_terminal "🎻 ${ticket:-$lane}" "tmux -L ${SOCKET} attach -t ${lane}" && say "attach → ${lane}"
 }
 
 replay_recording() {
   need_cmux || return 0
+  if [ -n "$codex_session_id" ]; then
+    local codex_jsonl
+    codex_jsonl="$(find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name "*${codex_session_id}*.jsonl" -print 2>/dev/null | head -1)"
+    [ -n "$codex_jsonl" ] || { say "no Codex rollout for ${codex_session_id}"; return 0; }
+    cmux_terminal "📼 ${ticket:-codex}" "python3 ${HERE}/transcript.py ${codex_jsonl} | less -R" && say "replay ${codex_jsonl}"
+    return 0
+  fi
   [ -n "$worktree" ] || { say "no worktree recorded for ${ticket:-this row}"; return 0; }
   # Claude Code stores a run's transcript under ~/.claude/projects/<slug>, where <slug> is
   # the worktree path with every char outside [A-Za-z0-9-] turned into '-' (e.g.
@@ -169,8 +178,8 @@ end_live_run() {
   # running after the card is reaped. No attach tab — we want it gone, not opened.
   # Same ticket-sanitize as attach; has-session is the gate so a hands-on row whose
   # ticket happens not to be a lane is a no-op here.
-  if [ -n "$ticket" ] && tmux -L "$SOCKET" has-session -t "$ticket" 2>/dev/null; then
-    if tmux -L "$SOCKET" kill-session -t "$ticket" 2>/dev/null; then
+  if [ -n "$lane" ] && tmux -L "$SOCKET" has-session -t "$lane" 2>/dev/null; then
+    if tmux -L "$SOCKET" kill-session -t "$lane" 2>/dev/null; then
       killed=1
       did=1
     else
@@ -183,7 +192,7 @@ end_live_run() {
     [ "$closed" -eq 1 ] && bits="closed cmux tab"
     if [ "$killed" -eq 1 ]; then
       [ -n "$bits" ] && bits="${bits} + "
-      bits="${bits}killed lane ${ticket}"
+      bits="${bits}killed lane ${lane}"
     fi
     say "ended ${ticket:-run}: ${bits}"
   elif [ "$no_cmux" -eq 1 ] && [ -n "$surface" ] && [ -z "$ticket" ]; then
@@ -191,7 +200,7 @@ end_live_run() {
   elif [ "$bad_surf" -eq 1 ] && [ "$kill_fail" -eq 0 ]; then
     say "end: bad cmux_surface id for ${ticket:-this row}"
   elif [ "$kill_fail" -eq 1 ]; then
-    say "end: kill-session failed for lane ${ticket}"
+    say "end: kill-session failed for lane ${lane}"
   else
     say "end: nothing to kill for ${ticket:-this row} (no live surface/lane)"
   fi
@@ -205,7 +214,7 @@ case "$key" in
         # cmux surface (a hands-on run). Only the former is an attachable tmux session;
         # attaching a cmux run by issue key fails "can't find session". has-session is the
         # authoritative gate — attach a real lane, else say so.
-        if [ -n "$ticket" ] && tmux -L "$SOCKET" has-session -t "$ticket" 2>/dev/null; then
+        if [ -n "$lane" ] && tmux -L "$SOCKET" has-session -t "$lane" 2>/dev/null; then
           attach_lane
         else
           # not a lane -> a hands-on run in its own cmux tab: jump to it

@@ -66,12 +66,20 @@ check(d.lane_live_match("PROJ-76", {"PROJ-76"}) is True, "bare row matches its l
 check(d.lane_live_match("PROJ-76-worker", {"PROJ-7"}) is False, "sibling PROJ-7 does NOT match PROJ-76-worker")
 check(d.lane_live_match("PROJ-7-worker", {"PROJ-76"}) is False, "no reverse cross-match either")
 check(d.lane_live_match("", {"PROJ-76"}) is False, "empty session never matches")
+check(d.lane_live_match("ember-codex-1", {"codex-seat-1"}, "codex-seat-1") is True,
+      "explicit tmux_session matches its persistent Codex lane")
+check(d.lane_live_match("ember-codex-1", {"ember-codex-1"}, "codex-seat-1") is False,
+      "explicit tmux_session overrides legacy row-id inference")
 
 # 5. pane_state precedence: terminal never live; live-but-stale -> ghost; fresh match -> live
 merged = {"session": "PROJ-1-worker", "state": "merged", "epoch": now}
 check(d.pane_state(merged, set(), {"PROJ-1"}, now) == "-", "terminal row never live (no synth)")
 fresh = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now}
 check(d.pane_state(fresh, set(), {"PROJ-9"}, now) == "live", "fresh matched lane -> live")
+codex_fresh = {"session": "ember-codex-1", "tmux_session": "codex-seat-1",
+               "state": "implementing", "epoch": now}
+check(d.pane_state(codex_fresh, set(), {"codex-seat-1"}, now) == "live",
+      "explicit Codex tmux lane -> live")
 old = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
 check(d.pane_state(old, set(), {"PROJ-9"}, now) == "ghost", "matched-but-stale lane -> ghost")
 gone = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}

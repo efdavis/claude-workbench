@@ -55,6 +55,14 @@
       "type": "string",
       "description": "The Claude Code session UUID driving this run (the transcript stem under ~/.claude/projects/<slug>/<uuid>.jsonl). Headless `claude --print` lanes render no statusline, so they have no /tmp gauge mirrors; dashboard.py resolves their ctx/cost LIVE by walking this session's transcript. Set by callers that know their session id up front (e.g. lane-pilot.sh mints it and passes --session-id). Absent for interactive rows, which gauge off the statusline mirrors instead."
     },
+    "codex_session_id": {
+      "type": "string",
+      "description": "The Codex thread UUID driving this row. Used to resolve the exact ~/.codex rollout for replay instead of guessing from the newest transcript in the worktree."
+    },
+    "tmux_session": {
+      "type": "string",
+      "description": "Exact persistent tmux session name on AGENT_DASHBOARD_TMUX_SOCKET. When present, pane liveness, Enter attach, and r termination use this value rather than inferring a lane from the issue or dashboard row id."
+    },
     "note": {
       "type": "string",
       "description": "One-line human-readable status the operator sees in the dashboard."

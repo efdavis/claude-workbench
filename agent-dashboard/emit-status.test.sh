@@ -29,6 +29,12 @@ jq -e 'has("pr_number") | not' "$f" >/dev/null 2>&1 && pass "pr omitted when not
 jq -e '.pr_number == "51" and .worktree_path == "/tmp/wt"' "$AGENT_DASHBOARD_STATE_DIR/s2.json" >/dev/null 2>&1 \
   && pass "optional fields present when passed" || fail "optional fields"
 
+"$E" --session s2ids --role worker --state implementing \
+  --tmux-session ember-codex-1 --codex-session-id 01234567-89ab-cdef-0123-456789abcdef
+jq -e '.tmux_session == "ember-codex-1" and .codex_session_id == "01234567-89ab-cdef-0123-456789abcdef"' \
+  "$AGENT_DASHBOARD_STATE_DIR/s2ids.json" >/dev/null 2>&1 \
+  && pass "tmux/Codex identity fields present" || fail "tmux/Codex identity fields"
+
 # 2b. cmux_surface: captured from $CMUX_SURFACE_ID, absent when unset
 CMUX_SURFACE_ID="AAAAAAAA-TEST-UUID" "$E" --session s2b --role worker --state started
 [ "$(jq -r '.cmux_surface' "$AGENT_DASHBOARD_STATE_DIR/s2b.json" 2>/dev/null)" = "AAAAAAAA-TEST-UUID" ] \

@@ -51,6 +51,13 @@ cmux_has "tmux -L agent-lanes attach -t PROJ-76\\n" && pass "attach: send target
 cmux_has "rename-tab" && cmux_has "🎻 PROJ-76" && pass "attach: rename-tab to soloist glyph" || fail "attach: rename-tab"
 case "$out" in *"attach → PROJ-76"*) pass "attach: status line" ;; *) fail "attach: status line (got: $out)" ;; esac
 
+# 1a-2. explicit tmux session is authoritative; ticket remains display metadata only
+reset_logs
+out="$("$H" runs enter '#193' implementing live "" /tmp/wt "" ember-codex-1)"
+{ tmux_has "ember-codex-1" && cmux_has "tmux -L agent-lanes attach -t ember-codex-1\\n"; } \
+  && pass "attach: explicit Codex tmux session" || fail "explicit tmux attach (got: $out)"
+case "$out" in *"attach → ember-codex-1"*) pass "explicit tmux: status line" ;; *) fail "explicit tmux status (got: $out)" ;; esac
+
 # 1b. enter on a GHOST row also attaches (the tmux session still exists)
 reset_logs
 out="$("$H" runs enter PROJ-76 implementing ghost "" /tmp/wt)"
@@ -103,6 +110,16 @@ out="$("$H" runs enter PROJ-1 merged - "" "$wt")"
 cmux_has "python3 $here/transcript.py $projdir/newest.jsonl | less -R\\n" \
   && pass "recording: renders NEWEST jsonl via transcript.py in a pager" || fail "recording: newest jsonl"
 case "$out" in *"replay "*newest.jsonl) pass "recording: status line" ;; *) fail "recording: status (got: $out)" ;; esac
+
+# 2b. Codex replay is resolved by exact thread id, never newest-by-worktree.
+reset_logs
+cid="01234567-89ab-cdef-0123-456789abcdef"
+mkdir -p "$HOME/.codex/sessions/2026/07/18"
+croll="$HOME/.codex/sessions/2026/07/18/rollout-$cid.jsonl"; : > "$croll"
+out="$("$H" runs enter '#193' done - "" "$wt" "" "" "$cid")"
+cmux_has "python3 $here/transcript.py $croll | less -R\\n" \
+  && pass "recording: exact Codex rollout by thread id" || fail "recording: exact Codex rollout"
+case "$out" in *"replay $croll"*) pass "Codex recording: status line" ;; *) fail "Codex recording status (got: $out)" ;; esac
 
 # 3. enter dead, no worktree recorded -> visible message, no cmux call
 reset_logs
