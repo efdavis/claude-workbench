@@ -13,7 +13,8 @@
 #
 # Usage:
 #   emit-status.sh --session <id> --role <role> --state <state> \
-#                  [--ticket PROJ-N] [--pr <number>] [--worktree <path>] [--model <name>] [--note "..."]
+#                  [--ticket PROJ-N] [--pr <number>] [--worktree <path>] [--model <name>] \
+#                  [--claude-session-id <uuid>] [--note "..."]
 #   emit-status.sh --remove --session <id>        # prune a run's snapshot
 #
 #   role  = planner | worker | reviewer | finisher | groomer | other
@@ -26,7 +27,7 @@ set -u
 
 warn() { [ -n "${AGENT_DASHBOARD_DEBUG:-}" ] && printf 'emit-status: %s\n' "$*" >&2; return 0; }
 
-session="" role="" state="" ticket="" pr="" note="" worktree="" model="" remove=""
+session="" role="" state="" ticket="" pr="" note="" worktree="" model="" claude_session_id="" remove=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --session)  session="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
     --note)     note="${2:-}";    shift; [ $# -gt 0 ] && shift ;;
     --worktree) worktree="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --model)    model="${2:-}";   shift; [ $# -gt 0 ] && shift ;;
+    --claude-session-id) claude_session_id="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --remove)   remove=1;         shift   ;;
     *)          warn "unknown arg: $1"; shift ;;
   esac
@@ -64,10 +66,10 @@ epoch="$(date +%s 2>/dev/null)" || { warn "date failed"; exit 0; }
 iso="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || iso=""
 tmp="$(mktemp "$state_dir/.${safe_session}.XXXXXX" 2>/dev/null)" || { warn "mktemp failed"; exit 0; }
 
-python3 - "$session" "$role" "$state" "$ticket" "$pr" "$worktree" "$note" "$iso" "$epoch" "${CMUX_SURFACE_ID:-}" "$model" \
+python3 - "$session" "$role" "$state" "$ticket" "$pr" "$worktree" "$note" "$iso" "$epoch" "${CMUX_SURFACE_ID:-}" "$model" "$claude_session_id" \
   > "$tmp" 2>/dev/null <<'PY' || { warn "python3 write failed"; rm -f "$tmp" 2>/dev/null; exit 0; }
 import base64, json, os, sys
-session, role, state, ticket, pr, worktree, note, iso, epoch, cmux_surface, model = sys.argv[1:12]
+session, role, state, ticket, pr, worktree, note, iso, epoch, cmux_surface, model, claude_session_id = sys.argv[1:13]
 if not model:
     model = os.environ.get("AGENT_DASHBOARD_MODEL", "")
 if not model:
@@ -95,6 +97,8 @@ if note:
     doc["note"] = note
 if cmux_surface:
     doc["cmux_surface"] = cmux_surface
+if claude_session_id:
+    doc["claude_session_id"] = claude_session_id
 json.dump(doc, sys.stdout)
 PY
 

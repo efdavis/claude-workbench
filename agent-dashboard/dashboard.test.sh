@@ -77,16 +77,16 @@ check(d.pane_state(old, set(), {"PROJ-9"}, now) == "ghost", "matched-but-stale l
 gone = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
 check(d.pane_state(gone, set(), set(), now) == "stale", "unmatched + past stale -> stale")
 
-# 5b. reapable (the `r` guard): terminal or stale is reapable; a live/ghost row is not,
-# so `r` can never yank a card out from under a running agent.
+# 5b. reapable = "dead card, no kill step needed": terminal or stale. Live/ghost still
+# get removed by `r`, but only after handler.sh ends the run (not card-only).
 check(d.reapable({"session": "t", "state": "merged", "epoch": now}, set(), set(), now) is True,
-      "terminal row is reapable")
+      "terminal row is reapable (card-only)")
 check(d.reapable({"session": "s", "state": "pr-open", "epoch": now - (20 * 60)}, set(), set(), now) is True,
-      "stale row is reapable")
+      "stale row is reapable (card-only)")
 _live = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now}
-check(d.reapable(_live, set(), {"PROJ-9"}, now) is False, "live row is NOT reapable")
+check(d.reapable(_live, set(), {"PROJ-9"}, now) is False, "live row needs end step first (not card-only)")
 _ghost = {"session": "PROJ-9-worker", "state": "implementing", "epoch": now - (20 * 60)}
-check(d.reapable(_ghost, set(), {"PROJ-9"}, now) is False, "ghost row is NOT reapable")
+check(d.reapable(_ghost, set(), {"PROJ-9"}, now) is False, "ghost row needs end step first (not card-only)")
 
 # 5c. reap_snapshot shells emit-status --remove and deletes the on-disk card (not the run)
 import os as _o, tempfile as _tf3, subprocess as _sp
@@ -98,10 +98,98 @@ _msg = d.reap_snapshot("reapme")
 check(not _o.path.exists(_card) and "reaped" in _msg, f"reap_snapshot deletes the card (msg={_msg!r})")
 check(d.reap_snapshot("") == "no row selected", "reap_snapshot with no session -> friendly no-op")
 
-# 5d. terminal rows persist — no auto-ageout; a day-old merged row still renders (cleared only by r)
+# 5d. terminal rows persist in render — no auto-ageout in order_rows; a day-old merged row
+# still renders (the file is cleared by `r` or the loop-level auto_prune, never by render).
 _old = [{"session": "old", "role": "finisher", "state": "merged", "ticket": "PROJ-1",
          "epoch": now - (24 * 3600), "note": "n"}]
 check(len(d.order_rows(_old, now)) == 1, "day-old terminal row persists (no auto-ageout)")
+
+# 5e. auto_prune_terminal reaps only terminal rows past the cutoff — spares young terminal
+# rows and any non-terminal (live/stale) row, and no-ops when disabled.
+import time as _t
+_now2 = int(_t.time())
+_sp.run(["bash", d.EMIT, "--session", "oldterm", "--role", "finisher", "--state", "done"], timeout=8)
+_sp.run(["bash", d.EMIT, "--session", "youngterm", "--role", "finisher", "--state", "done"], timeout=8)
+_snaps5e = [
+    {"session": "oldterm", "state": "done", "epoch": _now2 - 48 * 3600},
+    {"session": "youngterm", "state": "done", "epoch": _now2 - 3600},
+    {"session": "liveimpl", "state": "implementing", "epoch": _now2 - 48 * 3600},  # not terminal
+]
+d.REAP_TERMINAL_HOURS = 24
+d._prune_checked_at = 0.0
+_n = d.auto_prune_terminal(_snaps5e, _now2)
+check(_n == 1, f"auto_prune reaps only the old terminal row (n={_n})")
+check(not _o.path.exists(_o.path.join(_sd, "oldterm.json")), "auto_prune removed the old terminal card")
+check(_o.path.exists(_o.path.join(_sd, "youngterm.json")), "auto_prune kept the young terminal card")
+d.REAP_TERMINAL_HOURS = 0
+d._prune_checked_at = 0.0
+check(d.auto_prune_terminal(_snaps5e, _now2) == 0, "REAP_TERMINAL_HOURS<=0 disables the prune")
+
+# 5f. new_escalations: silent on the first frame (None), fires on the transition into
+# escalated, and does not re-fire while it stands or after it clears.
+_esc = {"session": "e1", "state": "escalated", "epoch": _now2}
+_new, _seen = d.new_escalations([_esc], None)
+check(_new == [] and _seen == {"e1"}, "first frame seeds the seen-set without alerting")
+_new, _seen = d.new_escalations([_esc], set())
+check(len(_new) == 1 and _new[0]["session"] == "e1", "a newly-escalated row is reported as new")
+_new, _seen = d.new_escalations([_esc], {"e1"})
+check(_new == [], "an already-seen escalation does not re-alert")
+_new, _seen = d.new_escalations([], {"e1"})
+check(_new == [] and _seen == set(), "a cleared escalation empties the seen-set")
+
+# 5g. quota window/lines readability: absent mirror -> labeled em-dash (not a vanished
+# slot); present -> explicit "% used"; the claude line always exists with 5h before 7d.
+check("—" in d._quota_win("5h", None, _now2), "absent quota window shows a labeled em-dash")
+_qw = d._ANSI.sub("", d._quota_win("5h", (62, _now2 + 3600), _now2))
+check("5h" in _qw and "62% used" in _qw, f"present quota window labels + '% used' ({_qw!r})")
+_ql = d.quota_lines(_now2)
+_c0 = d._ANSI.sub("", _ql[0])
+check(len(_ql) >= 1 and _c0.startswith("claude"), "quota_lines always leads with the claude line")
+check(_c0.index("5h") < _c0.index("7d"), "claude line puts the 5h wall before 7d")
+
+# 5h. Grok SuperGrok weekly helpers: proto parse + weekly mirror paints as 7d.
+check(d._grok_money_val({"val": 12119}) == 12119.0, "grok money unwraps {val: N}")
+check(d._grok_money_val(42) == 42.0, "grok money accepts plain numbers")
+check(d._grok_money_val(None) is None, "grok money None stays None")
+_ge = d._parse_iso_epoch("2026-08-01T00:00:00+00:00")
+check(isinstance(_ge, int) and _ge > 1_700_000_000, f"ISO epoch parses billingPeriodEnd ({_ge!r})")
+check(d._parse_iso_epoch("2026-08-01T00:00:00Z") == _ge, "ISO epoch accepts trailing Z")
+# Synthetic Connect envelope: config field1 = float 66.0 + period end timestamp.
+import struct as _struct, tempfile as _tf2
+_pct_bytes = _struct.pack("<f", 66.0)
+# Timestamp seconds = field 1 varint. Encode a known epoch ~2026-07-22.
+_reset = 1784746210
+def _varint(n):
+    out = bytearray()
+    while n > 0x7F:
+        out.append((n & 0x7F) | 0x80); n >>= 7
+    out.append(n & 0x7F); return bytes(out)
+_ts = b"\x08" + _varint(_reset)  # field 1 = seconds
+_cfg = (b"\x0d" + _pct_bytes  # field 1 wire5 float
+        + b"\x2a" + bytes([len(_ts)]) + _ts)  # field 5 = period end
+_msg = b"\x0a" + bytes([len(_cfg)]) + _cfg  # outer field 1 = config
+_env = b"\x00" + _struct.pack(">I", len(_msg)) + _msg
+_parsed = d._parse_grok_credits_proto(_env)
+check(_parsed is not None and _parsed[0] == 66 and _parsed[1] == _reset,
+      f"parse GetGrokCreditsConfig envelope → 66% / reset ({_parsed!r})")
+# Force a known weekly mirror and confirm quota_lines labels it `7d`.
+_qdir = _tf2.mkdtemp(prefix="ad-quota-")
+_prev_qdir = d.QUOTA_DIR
+d.QUOTA_DIR = __import__("pathlib").Path(_qdir)
+d._grok_weekly_checked_at = 1e18  # pin throttle so ensure_* never hits the network
+d._codex_weekly_checked_at = 1e18
+try:
+    (d.QUOTA_DIR / "grok-7d.txt").write_text(f"66 {_now2 + 86400}\n")
+    _ql2 = [d._ANSI.sub("", ln) for ln in d.quota_lines(_now2)]
+    _grok_lines = [ln for ln in _ql2 if ln.strip().startswith("grok")]
+    check(len(_grok_lines) == 1, f"grok weekly mirror yields one grok line ({_grok_lines!r})")
+    check(_grok_lines[0].split()[1] == "7d",
+          f"grok line uses 7d window label ({_grok_lines[0]!r})")
+    check("66% used" in _grok_lines[0], f"grok line shows pct used ({_grok_lines[0]!r})")
+finally:
+    d.QUOTA_DIR = _prev_qdir
+    import shutil as _shutil
+    _shutil.rmtree(_qdir, ignore_errors=True)
 
 # 6. no row overruns the panel border at a narrow width (80-col default). The cursor
 # gutter + glyph-widened state column push the fixed geometry past a narrow inner width;
@@ -116,6 +204,31 @@ d.COLOR = False
 # 7. char_width: VS16 (U+FE0F) and ZWJ (U+200D) are zero display columns
 check(d.char_width("\ufe0f") == 0, "VS16 counts as zero width (category Mn)")
 check(d.char_width("\u200d") == 0, "ZWJ counts as zero width (category Cf)")
+
+# 7b. `n` note panel: wrap_display + show_note expands the full note the table truncates
+check(d.wrap_display("", 10) == [""], "wrap empty -> one blank line")
+check(d.wrap_display("hello world", 20) == ["hello world"], "wrap fits on one line")
+_wrapped = d.wrap_display("one two three four five", 10)
+check(_wrapped == ["one two", "three four", "five"] or all(d.vlen(x) <= 10 for x in _wrapped),
+      f"wrap_display respects width (got {_wrapped!r})")
+_long = "queue empty: only #137 [Sonnet] open, strictly blocked (#135->#136->#137)"
+_snaps_note = [{"session": "s-long", "role": "worker", "state": "implementing",
+                "ticket": "#137", "epoch": now, "note": _long}]
+frame_note = d.render_frame(_snaps_note, set(), set(), {}, {}, now, 100,
+                            sel_session="s-long", show_note=True)
+check("note · #137" in d._ANSI.sub("", frame_note), "show_note panel title includes ticket")
+check(_long in d._ANSI.sub("", frame_note) or "strictly blocked" in d._ANSI.sub("", frame_note),
+      "show_note panel includes full note text (not truncated by the table cell)")
+check("n note" in d._ANSI.sub("", frame_note), "footer legend lists n note")
+frame_off = d.render_frame(_snaps_note, set(), set(), {}, {}, now, 100,
+                           sel_session="s-long", show_note=False)
+# Without show_note the panel title must not appear (table may still hold a truncated note).
+check("note · #137" not in d._ANSI.sub("", frame_off), "show_note=False omits the note panel")
+_empty_note = [{"session": "s-empty", "role": "worker", "state": "done",
+                "ticket": "X-1", "epoch": now, "note": ""}]
+frame_empty = d.render_frame(_empty_note, set(), set(), {}, {}, now, 100,
+                             sel_session="s-empty", show_note=True)
+check("(no note)" in d._ANSI.sub("", frame_empty), "empty note shows (no note) placeholder")
 
 # 8. dispatch_action seam: a non-string snapshot field (e.g. int pr_number) must NOT raise —
 # it coerces and shells out, honoring the module's "malformed snapshot never fatal" rule.

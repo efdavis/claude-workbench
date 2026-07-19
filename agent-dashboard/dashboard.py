@@ -6,25 +6,28 @@ renders a live cross-section of what every run is doing: which issue, which role
 state, how long, and which ones need you (escalations). Music-themed: the dashboard is
 the Orchestra, each run is a soloist, the dispatch lane spawner is the cue.
 
-It is a viewer that ROUTES, not a controller: a row cursor (j/k or arrows) plus three
-"open something" keys (Enter / p / t) that shell out to handler.sh (which owns every
-side effect — cmux tabs, tmux attach). dashboard.py mutates no live run; its only local
-write is the `r` key removing a finished/dead row's snapshot. A malformed or half-written
-snapshot is skipped, never fatal.
+It is a viewer that ROUTES: a row cursor (j/k or arrows) plus open keys (Enter / p / t)
+that shell out to handler.sh (cmux tabs, tmux attach), `n` which expands the focused
+row's note inline (local only), and `r` which reaps a card — for a live/ghost row that
+means open+end the pane first (handler closes the cmux surface / kills the lane), then
+remove the snapshot; for a finished/stale row it only removes the card. A malformed or
+half-written snapshot is skipped, never fatal.
 
 Point it at the same state dir the emitter uses (AGENT_DASHBOARD_STATE_DIR, default
 ~/Projects/claude-workbench/agent-dashboard/state) and leave it open in a pane while
 dispatch spawns lanes on the private `tmux -L <socket>` socket
-(AGENT_DASHBOARD_TMUX_SOCKET). Account-wide quota mirrors (claude/codex/grok 5h+7d)
-live under the sibling quota/ dir and are dual-written to /tmp for back-compat. Any
-vendor whose data is absent (no ~/.codex, no grok mirror) simply doesn't render — so
-this is vendor-neutral out of the box on an enterprise-Claude-only machine.
+(AGENT_DASHBOARD_TMUX_SOCKET). Account-wide quota mirrors (claude 5h+7d, codex 7d,
+grok SuperGrok weekly) live under the sibling quota/ dir and are dual-written to /tmp
+for back-compat. Any vendor whose data is absent (no ~/.codex, no ~/.grok) simply
+doesn't render — so this is vendor-neutral out of the box on an enterprise-Claude-only
+machine.
 
 Pure stdlib on purpose — no pip install. Box-drawing panels + ANSI; honors NO_COLOR.
 
 Keys:  j/k or ↑/↓ move · Enter open (jump to a cmux run's tab / attach a live lane /
-       replay a finished one) · p open PR · t open issue · r reap (remove a dead/merged
-       row) · q or Ctrl-C quit
+       replay a finished one) · p open PR · t open issue · n note (expand the focused
+       row's full note — the table column truncates) · r reap (end a live/ghost run and
+       remove its card; or just clear a dead/stale card) · q or Ctrl-C quit
 Run:   python3 dashboard.py
 """
 from __future__ import annotations
@@ -61,6 +64,16 @@ QUOTA_DIR = Path(os.environ.get("AGENT_DASHBOARD_QUOTA_DIR",
 PILOT_DIR = Path(os.environ["PILOT_LIGHT_DIR"]).expanduser() if os.environ.get("PILOT_LIGHT_DIR") else None
 REFRESH_SECS = float(os.environ.get("AGENT_DASHBOARD_REFRESH", "2"))
 STALE_SECS = int(os.environ.get("AGENT_DASHBOARD_STALE_SECS", str(15 * 60)))
+# Terminal (merged/done) rows persist as tombstones until reaped; left alone they pile up
+# (a week of dead cards, each re-read every refresh). Auto-reap the ones older than this so
+# the board self-cleans. Default 2 days; set <=0 to disable and reap only by hand with `r`.
+REAP_TERMINAL_HOURS = float(os.environ.get("AGENT_DASHBOARD_REAP_TERMINAL_HOURS", "48"))
+# A run going `escalated` is the one event that needs you NOW — but you only see it if
+# you're already staring at the board. Ring the terminal bell when a NEW escalation
+# appears (transition, not every frame it stays up). Also post a macOS notification when
+# AGENT_DASHBOARD_ESCALATION_NOTIFY=1. Bell honors NO_BELL / AGENT_DASHBOARD_NO_BELL.
+ESCALATION_NOTIFY = os.environ.get("AGENT_DASHBOARD_ESCALATION_NOTIFY") == "1"
+ESCALATION_BELL = not ("NO_BELL" in os.environ or "AGENT_DASHBOARD_NO_BELL" in os.environ)
 # Neutral default (matches upstream). This board benefits from more width — it carries two
 # extra columns (ctx + cost) — so widen it per-machine with AGENT_DASHBOARD_MAX_WIDTH
 # rather than baking a wide default into the shared repo.
@@ -169,6 +182,8 @@ ACCURATE_COST_REFRESH_SECS = int(os.environ.get("AGENT_DASHBOARD_COST_REFRESH", 
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _accurate_cost_cache: dict[str, float] = {}
 _accurate_cost_checked_at = 0.0
+_accurate_ctx_cache: dict[str, int] = {}
+_accurate_ctx_checked_at = 0.0
 
 
 # A Claude session id is a canonical UUID. The bridge value comes from a world-writable
@@ -216,10 +231,74 @@ def _cost_for_session(uuid: str) -> "float | None":
         return None
 
 
+# Model context-window size (tokens) for the live ctx gauge. The account default is 200k;
+# a row's transcript names its model, so a wider-window model could be special-cased later.
+_CTX_WINDOW_TOKENS = 200_000
+
+
+def _ctx_for_session(uuid: str) -> "int | None":
+    """Live context-window % for one Claude session from the LAST assistant `usage` block
+    in its top-level transcript: input + cache-read + cache-creation tokens = the prompt
+    size sent that turn, i.e. current window occupancy. That's the same basis the statusline
+    shows for interactive rows — computed locally here so a headless `--print` lane (which
+    renders no statusline, hence no /tmp ctx mirror) still gets a live ctx gauge. Only the
+    top-level transcript matters: ctx is the MAIN session's window, not its subagents'. Any
+    failure (no transcript, unreadable, no usage) -> None. Never raises."""
+    matches = glob.glob(str(_CLAUDE_PROJECTS / "*" / f"{uuid}.jsonl"))
+    if not matches:
+        return None
+    usage = None
+    try:
+        # Files run to MBs; the `"usage"` substring pre-filter keeps this to a JSON parse
+        # per assistant turn, not per line. Last matching record wins (most recent turn).
+        with open(matches[0], "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                u = rec.get("message", {}).get("usage")
+                if isinstance(u, dict) and ("input_tokens" in u or "cache_read_input_tokens" in u):
+                    usage = u
+    except OSError:
+        return None
+    if not usage:
+        return None
+    tokens = (int(usage.get("input_tokens", 0) or 0)
+              + int(usage.get("cache_read_input_tokens", 0) or 0)
+              + int(usage.get("cache_creation_input_tokens", 0) or 0))
+    if tokens <= 0:
+        return None
+    return max(0, min(100, int(round(tokens / _CTX_WINDOW_TOKENS * 100))))
+
+
+def _own_session_rows(snaps: list[dict]):
+    """Yield (UPPER(dashboard session id), Claude session uuid) for non-terminal rows that
+    carry their own `claude_session_id` — headless lanes that minted their session up front
+    and have no statusline mirror. Keyed by the DASHBOARD session id (not surface) because
+    that's the join key these rows resolve their gauges on (`gauge_for` falls back to it when
+    the surface has no live mirror, which is exactly the headless case)."""
+    for s in snaps:
+        if s.get("state") in TERMINAL_STATES:
+            continue
+        csid = str(s.get("claude_session_id", "")).strip()
+        if csid and _SESSION_UUID_RE.match(csid):
+            key = str(s.get("session", "")).upper()
+            if key:
+                yield key, csid
+
+
 def read_accurate_costs(snaps: list[dict], now: int | float) -> dict[str, float]:
-    """UPPER(surface id) -> accurate USD, for the non-terminal rows we can bridge to a
-    Claude session. Throttled to ACCURATE_COST_REFRESH_SECS (cost.py walks transcripts,
-    so it's not a per-2s-refresh cost); the cache paints between refreshes."""
+    """gauge_key -> accurate USD, for the non-terminal rows we can bridge to a Claude
+    session. Two sources, own-session first (authoritative, no /tmp): rows with a
+    `claude_session_id` resolve keyed by their dashboard session id; the rest use the
+    statusline surface->sessionid bridge, keyed by surface (original behavior). Throttled to
+    ACCURATE_COST_REFRESH_SECS (cost.py walks transcripts, so it's not a per-2s cost); the
+    cache paints between refreshes."""
     global _accurate_cost_checked_at
     now_f = float(now)
     # Gate on WHEN we last checked, not on whether the cache has entries: a window where
@@ -230,11 +309,19 @@ def read_accurate_costs(snaps: list[dict], now: int | float) -> dict[str, float]
     if _accurate_cost_checked_at and now_f - _accurate_cost_checked_at < ACCURATE_COST_REFRESH_SECS:
         return dict(_accurate_cost_cache)
     _accurate_cost_checked_at = now_f
-    bridge = _surface_to_sessionid()
     fresh: dict[str, float] = {}
+    # 1) rows with their own session id (headless lanes) — keyed by dashboard session id
+    for key, uuid in _own_session_rows(snaps):
+        usd = _cost_for_session(uuid)
+        if usd is not None:
+            fresh[key] = usd
+    # 2) statusline surface bridge for the rest (interactive cmux rows) — keyed by surface
+    bridge = _surface_to_sessionid()
     for s in snaps:
         if s.get("state") in TERMINAL_STATES:
             continue
+        if str(s.get("claude_session_id", "")).strip():
+            continue  # own-session row already handled in (1)
         surface = str(s.get("cmux_surface", "")).upper()
         uuid = bridge.get(surface) if surface else None
         if not uuid:
@@ -244,6 +331,27 @@ def read_accurate_costs(snaps: list[dict], now: int | float) -> dict[str, float]
             fresh[surface] = usd
     _accurate_cost_cache.clear()
     _accurate_cost_cache.update(fresh)
+    return fresh
+
+
+def read_accurate_ctx(snaps: list[dict], now: int | float) -> dict[str, int]:
+    """UPPER(dashboard session id) -> live context-window %, for headless rows carrying a
+    `claude_session_id`. Only these rows: interactive/cmux rows have an authoritative
+    statusline ctx mirror (read_ctx), and the transcript derivation here is a 200k-window
+    approximation, so it fills ONLY rows that otherwise show '-'. Same throttle/cache shape
+    as read_accurate_costs; the transcript read is cheap (local last-usage scan, no subprocess)."""
+    global _accurate_ctx_checked_at
+    now_f = float(now)
+    if _accurate_ctx_checked_at and now_f - _accurate_ctx_checked_at < ACCURATE_COST_REFRESH_SECS:
+        return dict(_accurate_ctx_cache)
+    _accurate_ctx_checked_at = now_f
+    fresh: dict[str, int] = {}
+    for key, uuid in _own_session_rows(snaps):
+        pct = _ctx_for_session(uuid)
+        if pct is not None:
+            fresh[key] = pct
+    _accurate_ctx_cache.clear()
+    _accurate_ctx_cache.update(fresh)
     return fresh
 
 
@@ -317,7 +425,10 @@ def ctx_cell(pct: "int | None", bar_cells: int = CTX_BAR_CELLS) -> tuple[str, tu
 # older readers (and anything that still greps /tmp) keep working.
 # Claude: statusline.sh from rate_limits.five_hour / seven_day.
 # Codex: dashboard refreshes from ChatGPT wham/usage (or latest rollout fallback).
-# Grok: optional mirror only (no stable public weekly % API yet) — dashboard shows "—".
+# Grok: dashboard refreshes SuperGrok *weekly* pool from
+#       grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (Connect/protobuf).
+#       That is the "Weekly SuperGrok Limit" bar in grok.com Settings → Usage
+#       (Grok Build + Imagine + API share one weekly %). There is no 5h window.
 RATE_LIMIT_QUOTA = "claude-5h.txt"       # durable name
 RATE_LIMIT_TMP = "/tmp/claude-rate-limit-5h.txt"
 CLAUDE_WEEKLY_QUOTA = "claude-7d.txt"
@@ -326,16 +437,31 @@ CODEX_WEEKLY_QUOTA = "codex-7d.txt"
 CODEX_WEEKLY_TMP = "/tmp/codex-rate-limit-7d.txt"
 GROK_WEEKLY_QUOTA = "grok-7d.txt"
 GROK_WEEKLY_TMP = "/tmp/grok-rate-limit-7d.txt"
+# Optional monthly Grok Build API-credit pool (cli-chat-proxy /v1/billing) — different
+# metric from SuperGrok weekly; kept as a read fallback only.
+GROK_MONTHLY_QUOTA = "grok-mo.txt"
+GROK_MONTHLY_TMP = "/tmp/grok-rate-limit-mo.txt"
 CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-# Don't hammer OpenAI on every 2s refresh; 60s is plenty for a weekly bar.
+GROK_AUTH_FILE = Path.home() / ".grok" / "auth.json"
+GROK_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+# SuperGrok weekly pool (Settings → Usage). Accepts Grok CLI OIDC Bearer.
+GROK_WEEKLY_USAGE_URL = (
+    "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+)
+# Don't hammer OpenAI / xAI on every 2s refresh; 60s is plenty for a quota bar.
 CODEX_WEEKLY_REFRESH_SECS = int(os.environ.get("AGENT_DASHBOARD_CODEX_WEEKLY_REFRESH", "60"))
+GROK_WEEKLY_REFRESH_SECS = int(os.environ.get(
+    "AGENT_DASHBOARD_GROK_WEEKLY_REFRESH",
+    os.environ.get("AGENT_DASHBOARD_GROK_MONTHLY_REFRESH", "60"),  # back-compat
+))
 QUOTA_BAR_CELLS = 10
 # The 5-hour plan usage limit ("Current session" in claude.ai settings) — this is the one
 # that actually stops work when it hits 100, so RED starts well before the wall.
 QUOTA_WARN, QUOTA_HOT, QUOTA_CRIT = 50, 75, 90
 _codex_weekly_checked_at = 0.0
+_grok_weekly_checked_at = 0.0
 
 
 def _quota_path(name: str) -> Path:
@@ -377,7 +503,8 @@ def _write_pct_reset(path: str | Path, pct: int, reset: int) -> None:
 def _update_quota_snapshot(key: str, pct: int, reset: int) -> None:
     """Refresh quota/snapshot.json so humans can eyeball last-known harness %.
 
-    Best-effort; never raises. Keys: claude_5h, claude_7d, codex_7d, grok_7d.
+    Best-effort; never raises. Keys: claude_5h, claude_7d, codex_7d, grok_7d
+    (optional grok_mo monthly credit mirror is still recorded if written).
     """
     snap_path = _quota_path("snapshot.json")
     try:
@@ -396,6 +523,7 @@ def _update_quota_snapshot(key: str, pct: int, reset: int) -> None:
             "claude_5h": RATE_LIMIT_QUOTA,
             "claude_7d": CLAUDE_WEEKLY_QUOTA,
             "codex_7d": CODEX_WEEKLY_QUOTA,
+            "grok_mo": GROK_MONTHLY_QUOTA,
             "grok_7d": GROK_WEEKLY_QUOTA,
         }.get(key, key + ".txt")))
         snap["sources"] = sources
@@ -434,35 +562,29 @@ def _format_resets(reset: int, now: int) -> str:
     return f"{left // 60}m"
 
 
-def format_quota_bar(label: str, pct: int, reset: int, now: int,
-                     name_styles: tuple[str, ...] = ()) -> str:
-    """One compact quota cell: 'claude 7d ███░░░░░░░ 42% used · 3d04h'.
-
-    Explicitly "used" (matching quota_cell's 5h bar) because a bare "0%" next to a mostly
-    empty bar reads as "0% left" — the opposite of what it means — right when it matters
-    most (a near-empty quota looks alarming instead of reassuring)."""
+def _quota_bar(pct: int) -> str:
+    """The ██░░ fill for a usage %, colored by the same ladder as the rest of the board."""
     pct = max(0, min(100, pct))
     color = _quota_color(pct)
     filled = round(pct / 100 * QUOTA_BAR_CELLS)
-    bar = c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
-    name = c(label, *name_styles) if name_styles else c(label, "dim")
-    return (name + " " + bar + " " + c(f"{pct}% used", *color)
-            + c(f" · {_format_resets(reset, now)}", "dim"))
+    return c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
 
 
-def quota_cell(now: int) -> str:
-    """Compact '5h ███░░░░░░░ 80% · 28m' for the title line. '' when unknown, so the
-    title reads exactly as it used to on a client that doesn't report rate limits."""
-    rl = read_rate_limit()
+def _quota_win(label: str, rl: "tuple[int, int] | None", now: int,
+               label_styles: tuple[str, ...] = ("dim",)) -> str:
+    """One window's cell — '5h ██████░░░░ 62% used·4h30'. rl is (pct, reset) or None; an
+    absent mirror renders '<label> —' so the slot still shows which window is missing.
+
+    "used" stays explicit because a bare "0%" next to a mostly empty bar reads as
+    "0% left" — the opposite of what it means — right when it matters most (a near-empty
+    quota looks alarming instead of reassuring)."""
     if rl is None:
-        return ""
+        return c(label, *label_styles) + " " + c("—", "dim")
     pct, reset = rl
     pct = max(0, min(100, pct))
-    color = _quota_color(pct)
-    filled = round(pct / 100 * QUOTA_BAR_CELLS)
-    bar = c("█" * filled, *color) + c("░" * (QUOTA_BAR_CELLS - filled), "dim")
-    return (c("5h ", "dim") + bar + " " + c(f"{pct}% used", *color)
-            + c(f" · resets {_format_resets(reset, now)}", "dim"))
+    return (c(label, *label_styles) + " " + _quota_bar(pct) + " "
+            + c(f"{pct}% used", *_quota_color(pct))
+            + c(f"·{_format_resets(reset, now)}", "dim"))
 
 
 def _refresh_codex_weekly_from_api() -> bool:
@@ -575,31 +697,327 @@ def ensure_codex_weekly_fresh(now: int | float | None = None) -> None:
     _refresh_codex_weekly_from_rollouts()
 
 
-def weekly_quota_line(now: int) -> str:
-    """One line under the title: weekly bars, one slot per vendor whose data is present.
+def _grok_money_val(node) -> "float | None":
+    """Unwrap Grok billing money objects ({"val": N}) or plain numbers. None if missing."""
+    if isinstance(node, dict) and "val" in node:
+        try:
+            return float(node["val"])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(node, (int, float)):
+        return float(node)
+    return None
 
-    Claude always renders (the always-on seat, '—' until its first mirror). codex/grok
-    render ONLY when a mirror actually exists — so an enterprise-Claude-only machine (no
-    ~/.codex, no grok mirror) shows just claude, with no empty vendor slots. That is the
-    vendor-neutral-out-of-the-box behavior: presence of data, not a config flag, decides
-    what shows. Reads durable Projects/quota first, then /tmp; colors match MODEL_COLOR."""
+
+def _parse_iso_epoch(s: str) -> "int | None":
+    """Parse an ISO-8601 timestamp (with Z or offset) to a unix epoch. None on failure."""
+    if not s or not isinstance(s, str):
+        return None
+    raw = s.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        # datetime.fromisoformat handles "+00:00"; strptime fallback for older shapes.
+        return int(datetime.fromisoformat(raw).timestamp())
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+            try:
+                return int(datetime.strptime(raw, fmt).timestamp())
+            except ValueError:
+                continue
+    return None
+
+
+def _grok_auth_entry() -> "tuple[str, dict] | None":
+    """Return (auth.json top-level key, entry dict) for the first OIDC session, or None."""
+    try:
+        auth = json.loads(GROK_AUTH_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(auth, dict):
+        return None
+    for k, v in auth.items():
+        if isinstance(v, dict) and (v.get("refresh_token") or v.get("key") or v.get("access_token")):
+            return k, v
+    return None
+
+
+def _grok_access_token(persist_refresh: bool = True) -> "str | None":
+    """Return a usable Grok OIDC access token.
+
+    Prefer the still-valid stored access token (auth entry `key`) so we do not burn a
+    refresh on every dashboard tick. When the access token is missing/expired, refresh
+    via auth.x.ai and — if the IdP rotates the refresh token — write the new tokens
+    back to ~/.grok/auth.json so the Grok CLI keeps working. Best-effort; never raises.
+    """
+    found = _grok_auth_entry()
+    if not found:
+        return None
+    auth_key, entry = found
+    access = entry.get("key") or entry.get("access_token")
+    exp = _parse_iso_epoch(str(entry.get("expires_at") or ""))
+    # 90s skew: refresh a little early so a long paint doesn't race the expiry.
+    if access and exp is not None and exp > time.time() + 90:
+        return str(access)
+    if access and exp is None:
+        # No expiry recorded — try the stored token; caller will fall through on 401.
+        return str(access)
+
+    refresh = entry.get("refresh_token")
+    client_id = entry.get("oidc_client_id")
+    if not refresh or not client_id:
+        return str(access) if access else None
+
+    try:
+        import urllib.parse
+        import urllib.request
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }).encode()
+        req = urllib.request.Request(
+            GROK_TOKEN_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "agent-dashboard",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            tok = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return str(access) if access else None
+
+    new_access = tok.get("access_token")
+    if not new_access:
+        return str(access) if access else None
+
+    if persist_refresh:
+        try:
+            auth = json.loads(GROK_AUTH_FILE.read_text())
+            cur = auth.get(auth_key) if isinstance(auth, dict) else None
+            if isinstance(cur, dict):
+                cur = dict(cur)
+                cur["key"] = new_access
+                if tok.get("refresh_token"):
+                    cur["refresh_token"] = tok["refresh_token"]
+                expires_in = tok.get("expires_in")
+                try:
+                    exp_epoch = int(time.time()) + int(expires_in)
+                    cur["expires_at"] = datetime.utcfromtimestamp(exp_epoch).strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    )
+                except (TypeError, ValueError, OSError):
+                    pass
+                auth[auth_key] = cur
+                GROK_AUTH_FILE.write_text(json.dumps(auth, indent=2) + "\n")
+        except (OSError, ValueError, TypeError):
+            pass
+    return str(new_access)
+
+
+def _pb_read_varint(buf: bytes, i: int) -> "tuple[int, int]":
+    """Read a protobuf varint; returns (value, new_index)."""
+    result = 0
+    shift = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, i
+
+
+def _pb_decode_fields(buf: bytes) -> "list[tuple[int, str, object]]":
+    """Decode a protobuf message into (field_no, kind, value) tuples. Best-effort."""
+    fields: list[tuple[int, str, object]] = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        key, i = _pb_read_varint(buf, i)
+        field_no = key >> 3
+        wire = key & 7
+        if wire == 0:
+            val, i = _pb_read_varint(buf, i)
+            fields.append((field_no, "varint", val))
+        elif wire == 1:
+            if i + 8 > n:
+                break
+            fields.append((field_no, "64bit", buf[i:i + 8]))
+            i += 8
+        elif wire == 2:
+            ln, i = _pb_read_varint(buf, i)
+            if i + ln > n:
+                break
+            fields.append((field_no, "bytes", buf[i:i + ln]))
+            i += ln
+        elif wire == 5:
+            if i + 4 > n:
+                break
+            fields.append((field_no, "32bit", buf[i:i + 4]))
+            i += 4
+        else:
+            break
+    return fields
+
+
+def _pb_ts_seconds(fields: "list[tuple[int, str, object]]") -> "int | None":
+    """google.protobuf.Timestamp: field 1 = seconds."""
+    for n, kind, val in fields:
+        if n == 1 and kind == "varint" and isinstance(val, int) and val > 1_000_000_000:
+            return val
+    return None
+
+
+def _parse_grok_credits_proto(payload: bytes) -> "tuple[int, int] | None":
+    """Parse GetGrokCreditsConfig Connect/protobuf body → (usage_pct, reset_epoch).
+
+    Observed GrokUsageInfo shape (field numbers stable as of 2026-07):
+      1: credit_usage_percent (float32)
+      4: current_period.start (Timestamp)
+      5: current_period.end   (Timestamp)  ← weekly SuperGrok reset
+    Outer response wraps that message in field 1 (`config`).
+    """
+    import struct as _struct
+    try:
+        # Connect unary envelope: flags(1) + big-endian length(4) + message
+        if len(payload) >= 5 and payload[0] in (0, 1):
+            msg_len = int.from_bytes(payload[1:5], "big")
+            msg = payload[5:5 + msg_len]
+        else:
+            msg = payload
+        top = _pb_decode_fields(msg)
+        # Prefer nested config (field 1 length-delimited); else treat top as the config.
+        cfg_bytes = None
+        for n, kind, val in top:
+            if n == 1 and kind == "bytes" and isinstance(val, (bytes, bytearray)):
+                cfg_bytes = bytes(val)
+                break
+        cfg = _pb_decode_fields(cfg_bytes if cfg_bytes is not None else msg)
+
+        pct: "int | None" = None
+        reset: "int | None" = None
+        start: "int | None" = None
+        for n, kind, val in cfg:
+            if n == 1 and kind == "32bit" and isinstance(val, (bytes, bytearray)) and len(val) == 4:
+                pct = int(round(float(_struct.unpack("<f", val)[0])))
+            elif kind == "bytes" and isinstance(val, (bytes, bytearray)):
+                ts = _pb_ts_seconds(_pb_decode_fields(bytes(val)))
+                if ts is None:
+                    continue
+                if n == 4:
+                    start = ts
+                elif n == 5:
+                    reset = ts
+                elif reset is None and ts > time.time():
+                    # Fallback: any future Timestamp-looking field.
+                    reset = ts
+        if pct is None:
+            return None
+        pct = max(0, min(100, pct))
+        if reset is None:
+            # Weekly window default: 7d from start, else 7d from now.
+            reset = (start + 7 * 86400) if start else int(time.time()) + 7 * 86400
+        return pct, int(reset)
+    except Exception:
+        return None
+
+
+def _refresh_grok_weekly_from_api() -> bool:
+    """Pull SuperGrok weekly usage % from GetGrokCreditsConfig. Returns True on write.
+
+    This is the same "Weekly SuperGrok Limit" bar as grok.com Settings → Usage
+    (Grok Build + Imagine + API share one weekly pool). Auth: Grok CLI OIDC Bearer
+    from ~/.grok/auth.json. Protocol: Connect unary protobuf (not JSON)."""
+    access = _grok_access_token()
+    if not access:
+        return False
+    try:
+        import struct as _struct
+        import urllib.request
+        # Empty protobuf request + Connect envelope (flags=0, length=0).
+        body = _struct.pack(">BI", 0, 0)
+        req = urllib.request.Request(
+            GROK_WEEKLY_USAGE_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {access}",
+                "Content-Type": "application/connect+proto",
+                "Accept": "application/connect+proto",
+                "Connect-Protocol-Version": "1",
+                "User-Agent": "agent-dashboard",
+                "Origin": "https://grok.com",
+                "Referer": "https://grok.com/",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = resp.read()
+    except Exception:
+        return False
+    parsed = _parse_grok_credits_proto(payload)
+    if not parsed:
+        return False
+    pct, reset = parsed
+    write_quota(GROK_WEEKLY_QUOTA, GROK_WEEKLY_TMP, pct, reset, "grok_7d")
+    return True
+
+
+def ensure_grok_weekly_fresh(now: int | float | None = None) -> None:
+    """Best-effort refresh of the SuperGrok weekly mirror. Throttled; never raises.
+
+    Fast-path out when ~/.grok/auth.json is missing so Claude/Codex-only machines never
+    hit xAI. Same 60s throttle shape as the Codex weekly poll."""
+    if not GROK_AUTH_FILE.exists():
+        return
+    global _grok_weekly_checked_at
+    now_f = float(now if now is not None else time.time())
+    if now_f - _grok_weekly_checked_at < GROK_WEEKLY_REFRESH_SECS:
+        if (_quota_path(GROK_WEEKLY_QUOTA).exists() or Path(GROK_WEEKLY_TMP).exists()
+                or _quota_path(GROK_MONTHLY_QUOTA).exists() or Path(GROK_MONTHLY_TMP).exists()):
+            return
+    _grok_weekly_checked_at = now_f
+    _refresh_grok_weekly_from_api()
+
+
+def read_grok_quota() -> "tuple[int, int] | None":
+    """Weekly SuperGrok mirror first; fall back to an optional monthly credit mirror."""
+    return (read_quota(GROK_WEEKLY_QUOTA, GROK_WEEKLY_TMP)
+            or read_quota(GROK_MONTHLY_QUOTA, GROK_MONTHLY_TMP))
+
+
+def quota_lines(now: int) -> list[str]:
+    """The quota block under the title — one line per vendor whose data is present.
+
+    claude ALWAYS renders: 5h first and bold (it's the limit that actually STOPS work),
+    then 7d riding along on the same line. codex and grok each render a 7d line when
+    their mirror exists (grok = SuperGrok weekly pool). An enterprise-Claude-only
+    machine (no ~/.codex, no ~/.grok) shows just the claude line, no empty vendor slots.
+    Presence of data, not a config flag, decides what shows. Vendor labels are padded
+    to a common width so the bars line up vertically across lines; colors match
+    MODEL_COLOR. Reads durable Projects/quota first, then /tmp."""
     ensure_codex_weekly_fresh(now)
-    #        name      durable                tmp                  name_styles          always
-    slots = (
-        ("claude", CLAUDE_WEEKLY_QUOTA, CLAUDE_WEEKLY_TMP, (),                    True),
-        ("codex",  CODEX_WEEKLY_QUOTA,  CODEX_WEEKLY_TMP,  MODEL_COLOR["codex"],  False),
-        ("grok",   GROK_WEEKLY_QUOTA,   GROK_WEEKLY_TMP,   MODEL_COLOR["grok"],   False),
-    )
-    parts: list[str] = []
-    for name, durable, tmp, name_styles, always in slots:
-        rl = read_quota(durable, tmp)
-        if rl is None:
-            if always:  # claude keeps a placeholder slot so the line is never empty
-                parts.append(c(name, *(name_styles or ("dim",))) + c(" 7d —", "dim"))
-            continue    # absent vendor -> no slot at all
-        pct, reset = rl
-        parts.append(format_quota_bar(f"{name} 7d", pct, reset, now, name_styles))
-    return "   ".join(parts)
+    ensure_grok_weekly_fresh(now)
+    pad = len("claude")  # widest vendor label -> window labels + bars align across lines
+    # claude line: the 5h wall (bold) leads, then 7d. A missing mirror still shows the
+    # labeled slot ('5h —') rather than vanishing, so the headline row never disappears.
+    claude = (c(f"{'claude':<{pad}} ", "bold")
+              + _quota_win("5h", read_rate_limit(), now, ("bold",))
+              + "   " + _quota_win("7d", read_quota(CLAUDE_WEEKLY_QUOTA, CLAUDE_WEEKLY_TMP), now))
+    out: list[str] = [claude]
+    codex_rl = read_quota(CODEX_WEEKLY_QUOTA, CODEX_WEEKLY_TMP)
+    if codex_rl is not None:
+        out.append(c(f"{'codex':<{pad}} ", *MODEL_COLOR["codex"])
+                   + _quota_win("7d", codex_rl, now))
+    grok_rl = read_grok_quota()
+    if grok_rl is not None:
+        # SuperGrok weekly pool (same bar as grok.com Settings → Usage).
+        out.append(c(f"{'grok':<{pad}} ", *MODEL_COLOR["grok"])
+                   + _quota_win("7d", grok_rl, now))
+    return out
 
 
 def c(text: str, *styles: str) -> str:
@@ -643,6 +1061,68 @@ def _cell(text, width: int) -> str:
             w += cw
         s = "".join(out) + "…"
     return s + " " * max(0, width - vlen(s))
+
+
+def wrap_display(text: str, width: int) -> list[str]:
+    """Word-wrap plain text to `width` display columns. Preserves explicit newlines;
+    hard-breaks tokens longer than `width`. Empty/None -> a single empty line so a
+    caller can still put a placeholder on top."""
+    width = max(1, int(width))
+    raw = "" if text is None else str(text)
+    if not raw:
+        return [""]
+    lines: list[str] = []
+    for para in raw.splitlines() or [""]:
+        if not para:
+            lines.append("")
+            continue
+        # Prefer breaks on spaces; fall back to hard-breaking an overlong token.
+        words = para.split(" ")
+        cur = ""
+        for w in words:
+            cand = w if not cur else f"{cur} {w}"
+            if vlen(cand) <= width:
+                cur = cand
+                continue
+            if cur:
+                lines.append(cur)
+                cur = ""
+            if vlen(w) <= width:
+                cur = w
+                continue
+            # Hard-break by display width (emoji-safe via char_width).
+            chunk, w_disp = [], 0
+            for ch in w:
+                cw = char_width(ch)
+                if chunk and w_disp + cw > width:
+                    lines.append("".join(chunk))
+                    chunk, w_disp = [], 0
+                chunk.append(ch)
+                w_disp += cw
+            cur = "".join(chunk)
+        if cur or not lines or lines[-1] != "":
+            # Always emit the trailing piece; an empty cur after a hard-break of the
+            # last token is already on `lines`.
+            if cur:
+                lines.append(cur)
+    return lines or [""]
+
+
+def note_panel_lines(snap: dict | None, width: int) -> list[str]:
+    """Box panel with the focused row's full note (the table's note column truncates).
+    `snap` None -> a one-line empty-selection panel so the key never fails silently."""
+    if snap is None:
+        return panel("note", [c("(no row selected)", "dim")], width)
+    tkt = snap.get("ticket") or snap.get("session") or "?"
+    sess = snap.get("session") or ""
+    title = f"note · {tkt}" + (f" · {sess}" if sess and sess != tkt else "")
+    note = snap.get("note")
+    if note is None or str(note).strip() == "":
+        body = [c("(no note)", "dim")]
+    else:
+        # Inner width matches panel() (width - 4 for "│ " + " │").
+        body = [c(ln, "white") for ln in wrap_display(str(note), max(1, width - 4))]
+    return panel(title, body, width, border=("cyan",))
 
 
 def load_snapshots() -> list[dict]:
@@ -721,15 +1201,15 @@ def pane_state(s: dict, cmux: set[str], lanes: set[str], now: int) -> str:
 
 
 def reapable(s: dict, cmux: set[str], lanes: set[str], now: int) -> bool:
-    """Whether the `r` key may remove this row's card: a terminal (merged/done) row, or a
-    non-terminal one gone stale (no live pane past the threshold — the 💀 rows). A live or
-    ghost row is never reapable, so `r` can't yank a card out from under a running agent."""
+    """Whether a row is a dead card that needs no kill step: terminal (merged/done) or
+    stale (💀 — no live pane past the threshold). Live/ghost rows are not "reapable" in
+    this sense; `r` still removes them, but only after handler.sh ends the run first."""
     return s.get("state") in TERMINAL_STATES or pane_state(s, cmux, lanes, now) == "stale"
 
 
 def reap_snapshot(session: str) -> str:
-    """The `r` action: remove one finished/dead row's snapshot through the single writer
-    (emit-status.sh --remove). Clears a card off the board; it never touches a live run."""
+    """Remove one row's on-disk snapshot through the single writer (emit-status.sh
+    --remove). Card-only; never kills a process — the live/ghost kill step is handler.sh."""
     if not session:
         return "no row selected"
     try:
@@ -737,6 +1217,34 @@ def reap_snapshot(session: str) -> str:
         return f"reaped {session}"
     except (OSError, subprocess.SubprocessError) as e:
         return f"reap failed: {e}"
+
+
+_prune_checked_at = 0.0
+
+
+def auto_prune_terminal(snaps: list[dict], now: int | float) -> int:
+    """Reap terminal (merged/done) snapshots older than REAP_TERMINAL_HOURS, so week-old
+    tombstones don't accumulate. Returns the count reaped. Best-effort and same single
+    writer as the `r` key (reap_snapshot -> emit-status --remove): only ever touches
+    terminal rows, never a live/ghost/stale run. Throttled to once a minute, and capped
+    per pass so a large first-run backlog reaps over a few passes instead of hitching one
+    frame. Disabled (no-op) when REAP_TERMINAL_HOURS <= 0."""
+    global _prune_checked_at
+    if REAP_TERMINAL_HOURS <= 0:
+        return 0
+    now_f = float(now)
+    if _prune_checked_at and now_f - _prune_checked_at < 60:
+        return 0
+    _prune_checked_at = now_f
+    cutoff = REAP_TERMINAL_HOURS * 3600
+    reaped = 0
+    for s in snaps:
+        if reaped >= 25:  # cap per pass; the rest reap on the next minute's check
+            break
+        if s.get("state") in TERMINAL_STATES and (now_f - int(s.get("epoch", 0))) > cutoff:
+            reap_snapshot(s.get("session", ""))
+            reaped += 1
+    return reaped
 
 
 def humanize_age(epoch: int, now: int) -> str:
@@ -927,11 +1435,15 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
                  costs: dict[str, float], ctxs: dict[str, int], now: int,
                  term_width: int, sel_session: str | None = None,
                  status_msg: str = "", term_height: int | None = None,
-                 scroll: list[int] | None = None) -> str:
+                 scroll: list[int] | None = None,
+                 show_note: bool = False) -> str:
     """scroll, if given, is a 1-element list used as an in/out parameter: read as this
     frame's starting scroll offset, written back with the offset actually used (clamped
     to keep sel_session in view) — the caller carries the same list into the next frame,
-    the same way it already threads sel_session across loop iterations."""
+    the same way it already threads sel_session across loop iterations.
+
+    show_note: when True, render a full-note panel for the focused row (the table's note
+    column truncates; `n` toggles this)."""
     width = max(64, min(term_width, MAX_WIDTH))
     inner = width - 4
     w_note = max(6, inner - GUTTER - (_FIXED + _SEPS))
@@ -941,18 +1453,37 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
     # (never truncated — that's the "need you" list), and as the scrollable window source.
     all_rows = order_rows(snaps, now, max_rows=len(snaps))
     escal = [s for s, d in all_rows if s.get("state") == "escalated"]
-    weekly = weekly_quota_line(now)
+    quota_block = quota_lines(now)
     pilot_lines = pilot_panel(width, now) if PILOT_DIR is not None else None
+    note_snap = next((s for s, _ in all_rows if s.get("session") == sel_session), None) \
+        if show_note else None
+    # Cap the expanded note so a novel-length field can't push the soloists off-screen.
+    # wrap first at panel width, then hard-cap body lines (panel chrome is 2).
+    if show_note:
+        raw_note = note_panel_lines(note_snap, width)
+        # Keep borders + at most ~12 body lines (title chrome is already in the panel).
+        max_note_body = 12
+        if len(raw_note) > max_note_body + 2:
+            note_lines = raw_note[: max_note_body + 1] + [raw_note[-1]]  # keep bottom border
+            # Flag truncation on the last body line before the border.
+            if len(note_lines) >= 2:
+                note_lines[-2] = c("… (truncated — note too long for the pane)", "dim")
+        else:
+            note_lines = raw_note
+    else:
+        note_lines = None
 
     if term_height is not None:
         # Everything in the frame *besides* the soloists panel's data rows: title, optional
         # weekly/status lines, the panel's own chrome (blank + borders + header row), the
-        # pilot panel, the escalations panel, and the trailing blank + footer. Getting this
-        # wrong just under- or over-fills the row budget by a line or two — not fatal — but
-        # skipping it entirely is what let the frame grow taller than the pane and scroll
-        # the title/header off the top before the user ever saw them.
-        fixed = 1 + (1 if weekly else 0) + (1 if status_msg else 0)
+        # pilot panel, the note detail panel, the escalations panel, and the trailing blank
+        # + footer. Getting this wrong just under- or over-fills the row budget by a line
+        # or two — not fatal — but skipping it entirely is what let the frame grow taller
+        # than the pane and scroll the title/header off the top before the user ever saw them.
+        fixed = 1 + len(quota_block) + (1 if status_msg else 0)
         fixed += 1 + 2 + 1  # blank + panel borders + header row
+        if note_lines is not None:
+            fixed += 1 + len(note_lines)
         if pilot_lines is not None:
             fixed += 1 + len(pilot_lines)
         if escal:
@@ -1048,15 +1579,16 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
              + (f"   🚨 escalated {len(escal)}" if escal else "   escalated 0")
              + f"   done {done_n}"
              + (f"   spend ${spend:,.2f}" if spend else ""))
-    quota = quota_cell(now)
-
-    lines: list[str] = [c(title, "bold") + (("   " + quota) if quota else "")]
-    if weekly:
-        lines.append(weekly)
+    lines: list[str] = [c(title, "bold")]
+    lines.extend(quota_block)
     if status_msg:
         lines.append(c("• " + status_msg, "cyan"))
     lines.append("")
     lines += panel("soloists", body, width)
+
+    if note_lines is not None:
+        lines.append("")
+        lines += note_lines
 
     if pilot_lines is not None:
         lines.append("")
@@ -1072,7 +1604,7 @@ def render_frame(snaps: list[dict], cmux: set[str], lanes: set[str],
 
     lines.append("")
     sysl = sys_line()
-    keys = "j/k ↑↓ move · ⏎ open · p PR · t issue · r reap · q quit"
+    keys = "j/k ↑↓ move · ⏎ open · p PR · t issue · n note · r end+reap · q quit"
     footer = ((f"{sysl}   " if sysl else "") + keys
               + f"   state:{STATE_DIR}   quota:{QUOTA_DIR}   refresh:{REFRESH_SECS:g}s")
     lines.append(c(footer, "dim"))
@@ -1333,6 +1865,45 @@ def dispatch_action(key: str, snap: dict | None, cmux: set[str], lanes: set[str]
         return f"handler error: {e}"
 
 
+def new_escalations(snaps: list[dict], seen: "set[str] | None") -> "tuple[list[dict], set[str]]":
+    """(rows that just went escalated, the current escalated-session set). `seen` is the
+    prior frame's set, threaded across frames like sel_session; None on the very first
+    frame means "don't alert on startup" — a board opened while an escalation already
+    stands shouldn't ring (you're looking now). Returns [] for `new` on that first frame."""
+    current = {s.get("session") for s in snaps if s.get("state") == "escalated" and s.get("session")}
+    if seen is None:
+        return [], current
+    fresh = current - seen
+    rows = [s for s in snaps if s.get("session") in fresh]
+    return rows, current
+
+
+def alert_escalation(rows: list[dict]) -> None:
+    """Ring the terminal bell (unless muted) and optionally post a macOS notification for
+    newly-escalated rows. Best-effort — an alert must never crash or block the loop."""
+    if not rows:
+        return
+    if ESCALATION_BELL:
+        try:
+            sys.stdout.write("\a")
+        except (OSError, ValueError):
+            pass
+    if ESCALATION_NOTIFY and sys.platform == "darwin":
+        # osascript is passed as argv (no shell), and the strings are scrubbed to a safe
+        # charset so a hand-edited note/session can't break out of the quoted literal.
+        def _safe(v: str) -> str:
+            return re.sub(r"[^A-Za-z0-9 ._#/-]", "", str(v))[:80]
+        who = ", ".join(_safe(s.get("ticket") or s.get("session") or "?") for s in rows[:4])
+        body = f"{len(rows)} run(s) need you: {who}"
+        try:
+            subprocess.Popen(
+                ["osascript", "-e",
+                 f'display notification "{_safe(body)}" with title "🚨 orchestra escalation"'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 _EOF = object()  # _read_key sentinel: stdin closed, distinct from a plain timeout (None)
 
 
@@ -1376,8 +1947,10 @@ def _oneshot() -> int:
     snaps = load_snapshots()
     costs = read_costs()
     costs.update(read_accurate_costs(snaps, now))
+    ctxs = read_ctx()
+    ctxs.update(read_accurate_ctx(snaps, now))  # live transcript ctx for headless lanes
     sys.stdout.write(render_frame(snaps, cmux_live(), tmux_lane_live(),
-                                  costs, read_ctx(), now, size.columns,
+                                  costs, ctxs, now, size.columns,
                                   term_height=size.lines))
     return 0
 
@@ -1411,7 +1984,9 @@ def main() -> int:
     old_termios = None
     sel_session: str | None = None
     status_msg = ""
+    show_note = False  # `n` toggles a full-note panel for the focused row
     scroll = [0]  # persists across frames, same as sel_session — render_frame follows the cursor
+    seen_escalated: set[str] | None = None  # None on frame 1 -> no ring for a standing escalation
     try:
         if interactive:
             try:
@@ -1425,9 +2000,13 @@ def main() -> int:
             now = int(time.time())
             size = shutil.get_terminal_size((120, 40))
             snaps = load_snapshots()
+            auto_prune_terminal(snaps, now)  # self-clean week-old tombstones (throttled inside)
+            new_esc, seen_escalated = new_escalations(snaps, seen_escalated)
+            alert_escalation(new_esc)  # ring/notify on a NEW escalation only
             cmux, lanes = cmux_live(), tmux_lane_live()
             costs, ctxs = read_costs(), read_ctx()
             costs.update(read_accurate_costs(snaps, now))  # accurate overrides mirror where resolvable
+            ctxs.update(read_accurate_ctx(snaps, now))     # live transcript ctx for headless lanes
             # Uncapped: MAX_ROWS/the height budget only limit what's visible per frame — the
             # cursor (and scrolling) can still reach every session, not just the first screenful.
             order = [s.get("session") for s, _ in order_rows(snaps, now, max_rows=len(snaps))]
@@ -1435,7 +2014,7 @@ def main() -> int:
                 sel_session = order[0] if order else None
             sys.stdout.write(render_frame(snaps, cmux, lanes, costs, ctxs, now, size.columns,
                                           sel_session, status_msg, term_height=size.lines,
-                                          scroll=scroll))
+                                          scroll=scroll, show_note=show_note))
             sys.stdout.flush()
 
             if not interactive:
@@ -1452,27 +2031,71 @@ def main() -> int:
                 break
             elif key in ("k", "\x1b[A"):
                 sel_session = move_sel(order, sel_session, -1)
+                # Note panel (if open) retargets to the newly focused row next frame.
             elif key in ("j", "\x1b[B"):
                 sel_session = move_sel(order, sel_session, +1)
+            elif key == "n":
+                # Toggle the full-note panel for the focused row. Local only — the note is
+                # already on the snapshot; no handler/cmux side effect.
+                show_note = not show_note
+                if show_note:
+                    by_id = {s.get("session"): s for s, _ in order_rows(snaps, now, max_rows=len(snaps))}
+                    snap = by_id.get(sel_session)
+                    if snap is None:
+                        status_msg = "no row selected"
+                    elif not str(snap.get("note") or "").strip():
+                        status_msg = f"no note for {snap.get('ticket') or snap.get('session') or 'this row'}"
+                    else:
+                        status_msg = "note open · n again to close"
+                else:
+                    status_msg = "note closed"
+            elif key == "\x1b" and show_note:
+                # Bare ESC closes an open note panel (doesn't steal ESC from other uses).
+                show_note = False
+                status_msg = "note closed"
             elif key in ("\r", "\n", "p", "t"):
                 by_id = {s.get("session"): s for s, _ in order_rows(snaps, now, max_rows=len(snaps))}
                 snap = by_id.get(sel_session)
                 act = "enter" if key in ("\r", "\n") else key
                 status_msg = dispatch_action(act, snap, cmux, lanes, now)
             elif key == "r":
+                # End+reap: for a live/ghost row, open/focus the pane and kill it (handler),
+                # then always remove the card. Dead cards (merged/done/stale) just drop the
+                # snapshot — never close their recorded cmux_surface (often a shared stale
+                # UUID from an earlier process). Non-terminal "-" rows (no pane match yet)
+                # also just clear the card so stuck board noise can be wiped in one key.
                 by_id = {s.get("session"): s for s, _ in order_rows(snaps, now, max_rows=len(snaps))}
                 snap = by_id.get(sel_session)
                 if snap is None:
                     status_msg = "no row selected"
-                elif reapable(snap, cmux, lanes, now):
-                    status_msg = reap_snapshot(snap.get("session", ""))
+                else:
+                    parts: list[str] = []
+                    pane = pane_state(snap, cmux, lanes, now)
+                    if pane in ("live", "ghost"):
+                        # If another live/ghost row still shares this cmux_surface, blank it
+                        # out for the handler so we don't close a tab another seat still owns.
+                        # (Tombstones already skip the end path; this covers the rare dual-live case.)
+                        end_snap = snap
+                        surf = str(snap.get("cmux_surface") or "").strip().upper()
+                        if surf:
+                            shared = any(
+                                s.get("session") != snap.get("session")
+                                and str(s.get("cmux_surface") or "").strip().upper() == surf
+                                and pane_state(s, cmux, lanes, now) in ("live", "ghost")
+                                for s in snaps
+                            )
+                            if shared:
+                                end_snap = dict(snap)
+                                end_snap["cmux_surface"] = ""
+                                parts.append("shared surface: skipped close")
+                        parts.append(dispatch_action("r", end_snap, cmux, lanes, now))
+                    parts.append(reap_snapshot(snap.get("session", "")))
+                    status_msg = " · ".join(p for p in parts if p)
                     # Move to the row above (computed against the still-current `order`, before
                     # the reaped row vanishes). Reaping the topmost row has no "above" to move
                     # to — move_sel clamps in place, so the now-gone id falls through the
                     # `sel_session not in order` check next frame and lands on the new top.
                     sel_session = move_sel(order, sel_session, -1)
-                else:
-                    status_msg = f"won't reap a live row ({snap.get('state', '?')}) — only merged/done/stale"
             else:
                 printable = key if key.isprintable() else repr(key)
                 status_msg = f"no action for '{printable}'"

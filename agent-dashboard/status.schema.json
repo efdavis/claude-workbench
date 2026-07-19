@@ -51,6 +51,10 @@
       "type": "string",
       "description": "The emitting session's cmux surface UUID ($CMUX_SURFACE_ID), captured best-effort by emit-status.sh. dashboard.py matches it against `cmux tree` for pane liveness. Absent outside cmux."
     },
+    "claude_session_id": {
+      "type": "string",
+      "description": "The Claude Code session UUID driving this run (the transcript stem under ~/.claude/projects/<slug>/<uuid>.jsonl). Headless `claude --print` lanes render no statusline, so they have no /tmp gauge mirrors; dashboard.py resolves their ctx/cost LIVE by walking this session's transcript. Set by callers that know their session id up front (e.g. lane-pilot.sh mints it and passes --session-id). Absent for interactive rows, which gauge off the statusline mirrors instead."
+    },
     "note": {
       "type": "string",
       "description": "One-line human-readable status the operator sees in the dashboard."

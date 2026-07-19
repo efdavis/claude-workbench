@@ -156,6 +156,40 @@ case "$out" in *"no issue for this row"*) pass "t: no issue -> visible msg" ;; *
 out="$("$H" runs x PROJ-76 implementing live "" /tmp/wt)"
 case "$out" in *"no action for key 'x'"*) pass "unknown key -> visible msg" ;; *) fail "unknown key (got: $out)" ;; esac
 
+# 9b. r on live hands-on run (surface, no lane): focus + flash + close-surface
+reset_logs
+out="$(MOCK_NO_LANE=1 "$H" runs r PROJ-12 implementing live "" "" 1E51549E-1D5C-4A64-AE65-9EEB918F46D9)"
+{ cmux_has "surface.focus" && cmux_has "close-surface" && cmux_has "1E51549E-1D5C-4A64-AE65-9EEB918F46D9" \
+    && case "$out" in *"ended"*|*"closed cmux tab"*) true ;; *) false ;; esac; } \
+  && pass "r live+surface: focus + close-surface" || fail "r live surface (got: $out)"
+
+# 9c. r on live dispatch lane (tmux session exists): kill-session
+reset_logs
+out="$("$H" runs r PROJ-76 implementing live "" /tmp/wt "")"
+{ tmux_has "kill-session" && tmux_has "PROJ-76" \
+    && case "$out" in *"killed lane"*|*"ended"*) true ;; *) false ;; esac; } \
+  && pass "r live+lane: kill-session" || fail "r live lane (got: $out)"
+
+# 9d. r on stale/tombstone: no kill (dashboard only reaps the card) — must not close-surface
+reset_logs
+out="$("$H" runs r PROJ-1 done stale "" /tmp/wt 1E51549E-1D5C-4A64-AE65-9EEB918F46D9)"
+{ ! cmux_has "close-surface" && ! tmux_has "kill-session" \
+    && case "$out" in *"nothing live to end"*) true ;; *) false ;; esac; } \
+  && pass "r stale: no kill, visible msg" || fail "r stale guard (got: $out)"
+
+# 9e. r on ghost behaves like live (still focus+close when surface present)
+reset_logs
+out="$(MOCK_NO_LANE=1 "$H" runs r PROJ-12 implementing ghost "" "" 1E51549E-1D5C-4A64-AE65-9EEB918F46D9)"
+{ cmux_has "close-surface" && case "$out" in *"ended"*|*"closed cmux tab"*) true ;; *) false ;; esac; } \
+  && pass "r ghost+surface: close-surface" || fail "r ghost surface (got: $out)"
+
+# 9f. r rejects a garbage cmux_surface (no close-surface; no JSON injection)
+reset_logs
+out="$(MOCK_NO_LANE=1 "$H" runs r PROJ-12 implementing live "" "" 'not-a-uuid";rm -rf /')"
+{ ! cmux_has "close-surface" && ! cmux_has "surface.focus" \
+    && case "$out" in *"bad cmux_surface"*) true ;; *) false ;; esac; } \
+  && pass "r bad surface id: refuse close" || fail "r bad surface (got: $out)"
+
 # 10. cmux ABSENT (tmux present, so the attach path IS reached) -> cmux install hint
 NOCMUX="$TMP/nocmux"; mkdir -p "$NOCMUX"; cp "$BIN/tmux" "$NOCMUX/tmux"
 out="$(PATH="$NOCMUX:/usr/bin:/bin" "$H" runs enter PROJ-76 implementing live "" /tmp/wt)"

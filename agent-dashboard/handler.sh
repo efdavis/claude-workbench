@@ -8,7 +8,7 @@
 # Usage: handler.sh <coord> <key> <issue> <state> <live> <pr> <worktree_path> <cmux_surface>
 #   <coord> : which list/pane the row lives in (currently always "runs"; kept for
 #             contract-shape parity with the dashboard→handler seam, not yet branched on).
-#   <key>   : enter | p | t
+#   <key>   : enter | p | t | r
 #   <live>  : the row's pane liveness from the collector (live | ghost | stale | -)
 #
 # cmux-required: if cmux is absent, print the install hint and no-op — no copy-paste
@@ -39,7 +39,10 @@ SOCKET="${AGENT_DASHBOARD_TMUX_SOCKET:-agent-lanes}"
 # Row fields come from a best-effort on-disk snapshot; the issue key is interpolated into
 # a command string cmux "types" into a live shell, so constrain it to the safe charset
 # (mirrors emit-status.sh's session sanitize). A well-formed issue key is untouched.
-ticket="$(printf '%s' "$ticket" | tr -c 'A-Za-z0-9._-' '_')"
+# Strip a leading '#' first (some snapshots carry "#39" rather than "39") — otherwise the
+# charset filter below turns it into "_39", which breaks both tmux session lookup and the
+# GitHub issue URL built from ISSUE_URL_BASE.
+ticket="$(printf '%s' "$ticket" | sed 's/^#//' | tr -c 'A-Za-z0-9._-' '_')"
 
 say() { printf '%s\n' "$*"; }
 
@@ -119,6 +122,81 @@ focus_cmux_tab() {  # $1 = cmux surface uuid
   say "jumped to ${ticket:-run}'s cmux tab"
 }
 
+# End a still-running row for the dashboard `r` key: open/focus its pane, then kill it.
+# Only called when the dashboard reports live|ghost — never on stale/tombstone rows, whose
+# cmux_surface is often a shared/stale UUID from an earlier process (closing it would kill
+# someone else's live tab). Best-effort; always prints exactly one status line; never exits
+# non-zero. Uses a silent cmux presence check (not need_cmux) so an install-hint can't
+# leak an extra stdout line before the final `say`.
+end_live_run() {
+  local did=0 closed=0 killed=0 no_cmux=0 bad_surf=0 kill_fail=0
+  case "$live" in
+    live|ghost) ;;
+    *)
+      say "nothing live to end for ${ticket:-this row}"
+      return 0
+      ;;
+  esac
+
+  # 1. Open the pane first (hands-on cmux surface): focus + flash so you see what you're
+  # ending, then close the surface (kills the agent process in that tab).
+  # Surface must look like a UUID (or surface:N ref) — never interpolate raw snapshot
+  # garbage into the focus JSON / close-surface argv.
+  if [ -n "$surface" ]; then
+    if printf '%s' "$surface" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$|^surface:[0-9]+$'; then
+      if command -v cmux >/dev/null 2>&1; then
+        local out ws
+        # Quiet focus (no early `say` — would break the one-line status contract).
+        out="$(cmux rpc surface.focus "{\"surface_id\":\"${surface}\"}" 2>/dev/null)" || true
+        ws="$(printf '%s\n' "$out" | grep '"workspace_id"' \
+              | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' \
+              | head -1)"
+        [ -n "${ws:-}" ] && cmux rpc workspace.select "{\"workspace_id\":\"${ws}\"}" >/dev/null 2>&1 || true
+        cmux trigger-flash --surface "$surface" >/dev/null 2>&1 || true
+        if cmux close-surface --surface "$surface" >/dev/null 2>&1; then
+          closed=1
+          did=1
+        fi
+      else
+        no_cmux=1
+      fi
+    else
+      bad_surf=1
+    fi
+  fi
+
+  # 2. Dispatch lane (tmux session named <issue>): kill it so the lane doesn't keep
+  # running after the card is reaped. No attach tab — we want it gone, not opened.
+  # Same ticket-sanitize as attach; has-session is the gate so a hands-on row whose
+  # ticket happens not to be a lane is a no-op here.
+  if [ -n "$ticket" ] && tmux -L "$SOCKET" has-session -t "$ticket" 2>/dev/null; then
+    if tmux -L "$SOCKET" kill-session -t "$ticket" 2>/dev/null; then
+      killed=1
+      did=1
+    else
+      kill_fail=1
+    fi
+  fi
+
+  if [ "$did" -eq 1 ]; then
+    local bits=""
+    [ "$closed" -eq 1 ] && bits="closed cmux tab"
+    if [ "$killed" -eq 1 ]; then
+      [ -n "$bits" ] && bits="${bits} + "
+      bits="${bits}killed lane ${ticket}"
+    fi
+    say "ended ${ticket:-run}: ${bits}"
+  elif [ "$no_cmux" -eq 1 ] && [ -n "$surface" ] && [ -z "$ticket" ]; then
+    say "install cmux (brew install cmux)"
+  elif [ "$bad_surf" -eq 1 ] && [ "$kill_fail" -eq 0 ]; then
+    say "end: bad cmux_surface id for ${ticket:-this row}"
+  elif [ "$kill_fail" -eq 1 ]; then
+    say "end: kill-session failed for lane ${ticket}"
+  else
+    say "end: nothing to kill for ${ticket:-this row} (no live surface/lane)"
+  fi
+}
+
 case "$key" in
   enter)
     case "$live" in
@@ -154,6 +232,9 @@ case "$key" in
     else
       open_browser "${ticket}" "${ISSUE_URL_BASE%/}/${ticket}"
     fi
+    ;;
+  r)
+    end_live_run
     ;;
   *)
     say "no action for key '${key}'"
